@@ -1,0 +1,1434 @@
+"""ClearVoice 主界面（PySide6）。
+
+功能页签：消除杂音（多类型 DSP + 去背景音乐）/ 分割（定长/特征/关键词正则）/
+合并分离 / 时间轴（变速裁剪）/ 特征剔除 / 语音转文字 / 翻译 / TTS / 设置。
+左栏：播放控制、波形选区、说话人与特征参考标记、进度与日志。
+"""
+from __future__ import annotations
+
+import os
+import re
+import traceback
+
+import numpy as np
+from PySide6.QtCore import Qt, QThread, QUrl, Signal
+from PySide6.QtGui import QPainter, QColor, QPen
+from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PySide6.QtMultimediaWidgets import QVideoWidget
+from PySide6.QtWidgets import (
+    QWidget, QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
+    QPushButton, QFileDialog, QComboBox,
+    QCheckBox, QDoubleSpinBox, QTabWidget, QPlainTextEdit,
+    QProgressBar, QMessageBox, QLineEdit, QGroupBox, QSizePolicy,
+)
+
+from . import ffmpeg_tools as ft
+from . import audio_ops
+from . import features
+from . import asr as msa
+from . import separation
+from . import translator
+from . import tts as tts_mod
+from . import config
+
+
+# ================================================================ 后台任务
+
+class Worker(QThread):
+    progress = Signal(int, str)
+    done = Signal(str, object)
+    failed = Signal(str, str)
+
+    def __init__(self, name: str, fn, *args, **kwargs):
+        super().__init__()
+        self.name = name
+        self.fn = fn
+        self.args = args
+        self.kwargs = kwargs
+
+    def run(self):
+        try:
+            result = self.fn(*self.args, progress_cb=self.progress.emit, **self.kwargs)
+            self.done.emit(self.name, result)
+        except Exception as e:  # noqa: BLE001
+            self.failed.emit(self.name, f"{e}\n{traceback.format_exc(limit=3)}")
+
+
+# ================================================================ 波形控件
+
+class WaveformWidget(QWidget):
+    clicked = Signal(float)          # 秒
+    selection_drawn = Signal(float, float)  # 起止秒（拖拽选择）
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(110)
+        self.envelope: np.ndarray | None = None   # (N,2) min/max
+        self.duration = 0.0
+        self.playhead = 0.0
+        self.sel: tuple[float, float] | None = None
+        self.speaker_ref: tuple[float, float] | None = None
+        self.feature_ref: tuple[float, float] | None = None
+        self._press_x: int | None = None
+        self._drag_x: int | None = None
+        self.setMouseTracking(False)
+
+    # ---------- 数据 ----------
+    def set_data(self, y: np.ndarray, sr: int, duration: float):
+        self.duration = duration
+        n = max(600, self.width())
+        if len(y) == 0:
+            self.envelope = None
+        else:
+            m = len(y) // n
+            if m < 1:
+                m = 1
+            trim = (len(y) // m) * m
+            yy = y[:trim].reshape(-1, m)
+            self.envelope = np.stack([yy.min(axis=1), yy.max(axis=1)], axis=1)
+        self.update()
+
+    def clear_all(self):
+        self.envelope = None
+        self.duration = 0.0
+        self.playhead = 0.0
+        self.sel = None
+        self.speaker_ref = None
+        self.feature_ref = None
+        self.update()
+
+    def _x2t(self, x: float) -> float:
+        if self.duration <= 0 or self.width() <= 0:
+            return 0.0
+        return max(0.0, min(1.0, x / self.width())) * self.duration
+
+    def _t2x(self, t: float) -> float:
+        if self.duration <= 0:
+            return 0
+        return t / self.duration * self.width()
+
+    # ---------- 绘制 ----------
+    def paintEvent(self, ev):  # noqa: N802
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(18, 18, 22))
+        w, h = self.width(), self.height()
+        mid = h / 2
+        # 选区着色
+        def shade(a, b, color):
+            if a is None or b is None or self.duration <= 0:
+                return
+            x1, x2 = self._t2x(min(a, b)), self._t2x(max(a, b))
+            p.fillRect(int(x1), 0, max(2, int(x2 - x1)), h, color)
+        shade(*(self.speaker_ref or (None, None)), QColor(80, 200, 120, 70))
+        shade(*(self.feature_ref or (None, None)), QColor(80, 140, 255, 70))
+        shade(*(self.sel or (None, None)), QColor(255, 160, 40, 80))
+        # 波形
+        if self.envelope is not None:
+            p.setPen(QPen(QColor(60, 220, 130), 1))
+            n = len(self.envelope)
+            step = w / n
+            for i in range(n):
+                lo, hi = self.envelope[i]
+                x = int(i * step)
+                p.drawLine(x, int(mid + lo * mid * 0.95), x, int(mid + hi * mid * 0.95))
+        else:
+            p.setPen(QColor(120, 120, 120))
+            p.drawText(self.rect(), Qt.AlignCenter, "打开音频/视频后显示波形（拖拽波形可选区间）")
+        # 播放头
+        p.setPen(QPen(QColor(255, 70, 70), 2))
+        x = self._t2x(self.playhead)
+        p.drawLine(int(x), 0, int(x), h)
+        # 拖拽预览线
+        if self._drag_x is not None:
+            p.setPen(QPen(QColor(255, 200, 60), 1))
+            p.drawLine(self._drag_x, 0, self._drag_x, h)
+        p.setPen(QColor(150, 150, 150))
+        p.drawText(6, 14, self._fmt(self.playhead))
+        p.end()
+
+    @staticmethod
+    def _fmt(t: float) -> str:
+        m = int(t // 60)
+        s = t - m * 60
+        return f"{m:02d}:{s:06.3f}"
+
+    # ---------- 鼠标 ----------
+    def mousePressEvent(self, ev):  # noqa: N802
+        if ev.button() == Qt.LeftButton:
+            self._press_x = ev.position().x()
+            self._drag_x = int(self._press_x)
+
+    def mouseMoveEvent(self, ev):  # noqa: N802
+        if self._press_x is not None:
+            self._drag_x = int(ev.position().x())
+            self.update()
+
+    def mouseReleaseEvent(self, ev):  # noqa: N802
+        if self._press_x is None:
+            return
+        x = ev.position().x()
+        moved = abs(x - self._press_x) > 6
+        if moved:
+            a, b = sorted((self._x2t(self._press_x), self._x2t(x)))
+            self.sel = (a, b)
+            self.selection_drawn.emit(a, b)
+        else:
+            self.clicked.emit(self._x2t(x))
+        self._press_x = None
+        self._drag_x = None
+        self.update()
+
+
+# ================================================================ 主窗口
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("ClearVoice — 音视频降噪 / 分割 / 合并工具")
+        self.resize(1280, 820)
+
+        self.src: str | None = None          # 当前媒体
+        self.info: ft.MediaInfo | None = None
+        self.wave_y: np.ndarray | None = None
+        self.wave_sr = 16000
+        self.speaker_ref: tuple[float, float] | None = None
+        self.feature_ref: tuple[float, float] | None = None
+        self.feature_ref_file: str | None = None
+        self.worker: Worker | None = None
+
+        self.player = QMediaPlayer()
+        self.audio_out = QAudioOutput()
+        self.audio_out.setVolume(1.0)
+        self.player.setAudioOutput(self.audio_out)
+
+        self._build_ui()
+        self._load_settings()
+        self._connect()
+
+    # ---------------------------------------------------------------- UI
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QHBoxLayout(central)
+
+        # ---- 左侧：视频 + 波形 + 播放控制
+        left = QVBoxLayout()
+        self.video = QVideoWidget()
+        self.video.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        left.addWidget(self.video, 6)
+
+        self.wave = WaveformWidget()
+        self.wave.setMinimumHeight(120)
+        left.addWidget(self.wave, 2)
+
+        ctl = QHBoxLayout()
+        self.btn_open = QPushButton("打开文件")
+        self.btn_play = QPushButton("播放")
+        self.btn_stop = QPushButton("停止")
+        self.rate = QComboBox()
+        self.rate.addItems(["0.25x", "0.5x", "0.75x", "1x", "1.25x", "1.5x", "2x", "3x", "4x"])
+        self.rate.setCurrentText("1x")
+        self.btn_slow = QPushButton("慢速 0.5x")
+        self.btn_slow.setCheckable(True)
+        self.btn_mark_in = QPushButton("标记开始")
+        self.btn_mark_out = QPushButton("标记结束")
+        self.btn_sel_clear = QPushButton("清除选择")
+        self.lbl_sel = QLabel("未选择区间")
+        for w in (self.btn_open, self.btn_play, self.btn_stop, self.rate, self.btn_slow,
+                  self.btn_mark_in, self.btn_mark_out, self.btn_sel_clear, self.lbl_sel):
+            ctl.addWidget(w)
+        ctl.addStretch(1)
+        left.addLayout(ctl)
+
+        act = QHBoxLayout()
+        self.btn_mute_sel = QPushButton("消音所选段")
+        self.btn_cut_sel = QPushButton("导出所选段")
+        self.btn_set_spk = QPushButton("设为说话人参考")
+        self.btn_set_feat = QPushButton("设为相似特征参考")
+        for w in (self.btn_mute_sel, self.btn_cut_sel, self.btn_set_spk, self.btn_set_feat):
+            act.addWidget(w)
+        act.addStretch(1)
+        left.addLayout(act)
+
+        self.time_label = QLabel("00:00.000 / 00:00.000")
+        left.addWidget(self.time_label)
+        root.addLayout(left, 7)
+
+        # ---- 右侧：功能面板
+        tabs = QTabWidget()
+        root.addWidget(tabs, 5)
+
+        # Tab1 消除杂音
+        t1 = QWidget()
+        f1 = QVBoxLayout(t1)
+        g1 = QGroupBox("选择要消除的声音类型（可多选）")
+        gv = QVBoxLayout(g1)
+        self.chk: dict[str, QCheckBox] = {}
+        for key, label in audio_ops.REMOVAL_TYPES:
+            self.chk[key] = QCheckBox(label)
+            gv.addWidget(self.chk[key])
+        self.chk["noise"].setChecked(True)
+        f1.addWidget(g1)
+        pf = QGridLayout()
+        pf.addWidget(QLabel("降噪强度"), 0, 0)
+        self.spin_strength = QDoubleSpinBox(); self.spin_strength.setRange(0.1, 1.0); self.spin_strength.setValue(0.85)
+        pf.addWidget(self.spin_strength, 0, 1)
+        pf.addWidget(QLabel("说话人匹配阈值"), 1, 0)
+        self.spin_spk_thr = QDoubleSpinBox(); self.spin_spk_thr.setRange(0.4, 0.99); self.spin_spk_thr.setSingleStep(0.01); self.spin_spk_thr.setValue(0.70)
+        pf.addWidget(self.spin_spk_thr, 1, 1)
+        f1.addLayout(pf)
+        self.btn_apply_removal = QPushButton("应用消除（生成新文件）")
+        f1.addWidget(self.btn_apply_removal)
+        self.btn_modelscope = QPushButton("魔塔模型增强（可选，需安装 extra）")
+        f1.addWidget(self.btn_modelscope)
+        g1b = QGroupBox("去背景音乐（人声/伴奏分离，HDemucs 离线模型）")
+        h1b = QHBoxLayout(g1b)
+        h1b.addWidget(QLabel("保留伴奏比例"))
+        self.spin_acc_keep = QDoubleSpinBox(); self.spin_acc_keep.setRange(0.0, 1.0); self.spin_acc_keep.setSingleStep(0.05); self.spin_acc_keep.setValue(0.0)
+        h1b.addWidget(self.spin_acc_keep)
+        self.chk_acc_out = QCheckBox("同时输出伴奏文件")
+        h1b.addWidget(self.chk_acc_out)
+        self.btn_music_remove = QPushButton("开始分离")
+        h1b.addWidget(self.btn_music_remove)
+        f1.addWidget(g1b)
+        f1.addStretch(1)
+        tabs.addTab(t1, "消除杂音")
+
+        # Tab2 分割
+        t2 = QWidget()
+        f2 = QVBoxLayout(t2)
+        g2 = QGroupBox("定长分割")
+        v2 = QVBoxLayout(g2)
+        h2 = QHBoxLayout()
+        h2.addWidget(QLabel("每段长度(秒)"))
+        self.spin_seg = QDoubleSpinBox(); self.spin_seg.setRange(0.5, 86400); self.spin_seg.setValue(60)
+        h2.addWidget(self.spin_seg)
+        self.btn_split_fixed = QPushButton("开始分割")
+        h2.addWidget(self.btn_split_fixed)
+        h2.addStretch(1)
+        v2.addLayout(h2)
+        f2.addWidget(g2)
+        g3 = QGroupBox("按声音特征分割")
+        v3 = QVBoxLayout(g3)
+        h3 = QHBoxLayout()
+        self.cmb_feat_split = QComboBox()
+        self.cmb_feat_split.addItems(["静音边界", "说话人参考区间", "相似特征参考"])
+        h3.addWidget(QLabel("特征")); h3.addWidget(self.cmb_feat_split)
+        self.btn_split_feat = QPushButton("开始分割")
+        h3.addWidget(self.btn_split_feat)
+        v3.addLayout(h3)
+        f2.addWidget(g3)
+        g3b = QGroupBox("按关键词 / 正则分割（语音识别，需魔塔模型）")
+        v3b = QVBoxLayout(g3b)
+        self.ed_kw = QLineEdit()
+        self.ed_kw.setPlaceholderText("关键词如: 大家好 ｜ 正则如: 第.{1,3}章（正则模式下生效）")
+        v3b.addWidget(self.ed_kw)
+        h3b = QHBoxLayout()
+        self.cmb_kw_mode = QComboBox()
+        self.cmb_kw_mode.addItems(["以关键字开头分割", "以关键字结束分割", "去掉关键字分割",
+                                   "正则前分割", "正则后分割", "抹正则分割"])
+        h3b.addWidget(self.cmb_kw_mode)
+        h3b.addWidget(QLabel("前留白(s)"))
+        self.spin_kw_pb = QDoubleSpinBox(); self.spin_kw_pb.setRange(0.0, 5.0); self.spin_kw_pb.setSingleStep(0.05); self.spin_kw_pb.setValue(0.10)
+        h3b.addWidget(self.spin_kw_pb)
+        h3b.addWidget(QLabel("后留白(s)"))
+        self.spin_kw_pa = QDoubleSpinBox(); self.spin_kw_pa.setRange(0.0, 5.0); self.spin_kw_pa.setSingleStep(0.05); self.spin_kw_pa.setValue(0.10)
+        h3b.addWidget(self.spin_kw_pa)
+        self.btn_split_kw = QPushButton("开始分割")
+        h3b.addWidget(self.btn_split_kw)
+        v3b.addLayout(h3b)
+        f2.addWidget(g3b)
+        f2.addStretch(1)
+        tabs.addTab(t2, "分割")
+
+        # Tab3 合并 / 分离
+        t3 = QWidget()
+        f3 = QVBoxLayout(t3)
+        g4 = QGroupBox("音视频合并")
+        v4 = QGridLayout(g4)
+        self.ed_video = QLineEdit(); self.ed_video.setPlaceholderText("视频文件")
+        self.ed_audio = QLineEdit(); self.ed_audio.setPlaceholderText("音频文件")
+        btn_v = QPushButton("..."); btn_a = QPushButton("...")
+        btn_v.setFixedWidth(32); btn_a.setFixedWidth(32)
+        v4.addWidget(QLabel("视频"), 0, 0); v4.addWidget(self.ed_video, 0, 1); v4.addWidget(btn_v, 0, 2)
+        v4.addWidget(QLabel("音频"), 1, 0); v4.addWidget(self.ed_audio, 1, 1); v4.addWidget(btn_a, 1, 2)
+        v4.addWidget(QLabel("音频偏移(秒, 正=延后)"), 2, 0)
+        self.spin_offset = QDoubleSpinBox(); self.spin_offset.setRange(-3600, 3600); self.spin_offset.setValue(0.0)
+        v4.addWidget(self.spin_offset, 2, 1)
+        self.chk_shortest = QCheckBox("对齐到较短流(-shortest)"); self.chk_shortest.setChecked(True)
+        v4.addWidget(self.chk_shortest, 3, 0, 1, 2)
+        self.btn_merge_av = QPushButton("合并")
+        v4.addWidget(self.btn_merge_av, 4, 0, 1, 3)
+        btn_v.clicked.connect(lambda: self._pick_into(self.ed_video, "视频", ft.VIDEO_EXTS))
+        btn_a.clicked.connect(lambda: self._pick_into(self.ed_audio, "音频", ft.AUDIO_EXTS))
+        f3.addWidget(g4)
+        g5 = QGroupBox("分离音频")
+        v5 = QVBoxLayout(g5)
+        self.btn_extract = QPushButton("从当前文件提取音频(WAV)")
+        v5.addWidget(self.btn_extract)
+        f5 = QHBoxLayout()
+        self.chk_extract_16k = QCheckBox("16kHz 单声道（默认）"); self.chk_extract_16k.setChecked(True)
+        f5.addWidget(self.chk_extract_16k)
+        v5.addLayout(f5)
+        f3.addWidget(g5)
+        f3.addStretch(1)
+        tabs.addTab(t3, "合并 / 分离")
+
+        # Tab4 时间轴
+        t4 = QWidget()
+        f4 = QVBoxLayout(t4)
+        g6 = QGroupBox("调整时间轴速度（视频+音频同步变速）")
+        v6 = QGridLayout(g6)
+        v6.addWidget(QLabel("倍速"), 0, 0)
+        self.spin_speed = QDoubleSpinBox(); self.spin_speed.setRange(0.1, 8.0); self.spin_speed.setSingleStep(0.1); self.spin_speed.setValue(1.0)
+        v6.addWidget(self.spin_speed, 0, 1)
+        self.btn_speed = QPushButton("应用变速")
+        v6.addWidget(self.btn_speed, 0, 2)
+        f4.addWidget(g6)
+        g7 = QGroupBox("裁剪")
+        v7 = QVBoxLayout(g7)
+        self.btn_trim = QPushButton("裁剪为所选区间")
+        v7.addWidget(self.btn_trim)
+        f4.addWidget(g7)
+        f4.addStretch(1)
+        tabs.addTab(t4, "时间轴")
+
+        # Tab5 特征剔除
+        t8 = QWidget()
+        f8 = QVBoxLayout(t8)
+        g8 = QGroupBox("按语言文字特征剔除（需要魔塔 ASR 模型）")
+        v8 = QVBoxLayout(g8)
+        self.ed_keywords = QLineEdit(); self.ed_keywords.setPlaceholderText("输入关键词，用逗号分隔，例如: 保密,内部资料")
+        v8.addWidget(self.ed_keywords)
+        h8 = QHBoxLayout()
+        h8.addWidget(QLabel("剔除方式"))
+        self.cmb_text_mode = QComboBox(); self.cmb_text_mode.addItems(["静音该段", "剪切该段"])
+        h8.addWidget(self.cmb_text_mode)
+        self.btn_text_remove = QPushButton("开始剔除")
+        h8.addWidget(self.btn_text_remove)
+        v8.addLayout(h8)
+        f8.addWidget(g8)
+        g9 = QGroupBox("按相似音频特征剔除（参考=标记区间或参考文件）")
+        v9 = QVBoxLayout(g9)
+        h9 = QHBoxLayout()
+        h9.addWidget(QLabel("相似阈值"))
+        self.spin_sim_thr = QDoubleSpinBox(); self.spin_sim_thr.setRange(0.4, 0.99); self.spin_sim_thr.setSingleStep(0.01); self.spin_sim_thr.setValue(0.78)
+        h9.addWidget(self.spin_sim_thr)
+        h9.addWidget(QLabel("剔除方式"))
+        self.cmb_sim_mode = QComboBox(); self.cmb_sim_mode.addItems(["静音该段", "剪切该段"])
+        h9.addWidget(self.cmb_sim_mode)
+        self.btn_sim_remove = QPushButton("开始剔除")
+        h9.addWidget(self.btn_sim_remove)
+        v9.addLayout(h9)
+        h9b = QHBoxLayout()
+        self.btn_feat_file = QPushButton("导入参考音频文件")
+        self.lbl_feat_file = QLabel("未导入")
+        h9b.addWidget(self.btn_feat_file); h9b.addWidget(self.lbl_feat_file); h9b.addStretch(1)
+        v9.addLayout(h9b)
+        f8.addWidget(g9)
+        f8.addStretch(1)
+        tabs.addTab(t8, "特征剔除")
+
+        # Tab6 语音转文字
+        t9 = QWidget()
+        f9 = QVBoxLayout(t9)
+        g10 = QGroupBox("识别输入（音频或视频，需要魔塔 ASR 模型）")
+        v10 = QGridLayout(g10)
+        self.ed_asr_src = QLineEdit(); self.ed_asr_src.setPlaceholderText("要识别的音频/视频文件")
+        btn_asr_pick = QPushButton("浏览…"); btn_asr_pick.setFixedWidth(64)
+        btn_asr_cur = QPushButton("使用当前文件"); btn_asr_cur.setFixedWidth(110)
+        v10.addWidget(self.ed_asr_src, 0, 0)
+        v10.addWidget(btn_asr_pick, 0, 1)
+        v10.addWidget(btn_asr_cur, 0, 2)
+        f9.addWidget(g10)
+        g11 = QGroupBox("输出格式（可多选）")
+        v11 = QVBoxLayout(g11)
+        self.chk_out_txt = QCheckBox("文本文档 (*.txt)"); self.chk_out_txt.setChecked(True)
+        self.chk_out_srt = QCheckBox("字幕文件 (*.srt)"); self.chk_out_srt.setChecked(True)
+        self.chk_out_lrc = QCheckBox("歌词文件 (*.lrc)"); self.chk_out_lrc.setChecked(True)
+        v11.addWidget(self.chk_out_txt); v11.addWidget(self.chk_out_srt); v11.addWidget(self.chk_out_lrc)
+        f9.addWidget(g11)
+        self.btn_asr_run = QPushButton("开始识别并导出")
+        f9.addWidget(self.btn_asr_run)
+        f9.addStretch(1)
+        tabs.addTab(t9, "语音转文字")
+
+        btn_asr_pick.clicked.connect(self._pick_asr_src)
+        btn_asr_cur.clicked.connect(self._asr_use_current)
+        self.btn_asr_run.clicked.connect(self.run_asr_export)
+
+        # Tab 翻译 / TTS
+        t11 = QWidget()
+        f11 = QVBoxLayout(t11)
+        g13 = QGroupBox("音频翻译（语音识别 → 翻译 → 双语导出）")
+        v13 = QGridLayout(g13)
+        self.ed_tr_src = QLineEdit(); self.ed_tr_src.setPlaceholderText("要翻译的音频/视频文件")
+        btn_tr_pick = QPushButton("浏览…"); btn_tr_pick.setFixedWidth(64)
+        btn_tr_cur = QPushButton("使用当前文件"); btn_tr_cur.setFixedWidth(110)
+        v13.addWidget(self.ed_tr_src, 0, 0)
+        v13.addWidget(btn_tr_pick, 0, 1)
+        v13.addWidget(btn_tr_cur, 0, 2)
+        v13.addWidget(QLabel("翻译方向"), 1, 0)
+        self.cmb_tr_pair = QComboBox(); self.cmb_tr_pair.addItems(list(translator.PAIRS.keys()))
+        v13.addWidget(self.cmb_tr_pair, 1, 1)
+        self.btn_translate = QPushButton("开始识别并翻译")
+        v13.addWidget(self.btn_translate, 2, 0, 1, 3)
+        lbl_tr = QLabel("输出: <源>.翻译.txt（双语对照）/ <源>.双语.srt / <源>.双语.lrc")
+        lbl_tr.setWordWrap(True)
+        v13.addWidget(lbl_tr, 3, 0, 1, 3)
+        f11.addWidget(g13)
+        g14 = QGroupBox("文字转语音（中 / 英 / 粤）")
+        v14 = QGridLayout(g14)
+        self.pte_tts = QPlainTextEdit(); self.pte_tts.setPlaceholderText("输入要合成的文本…")
+        self.pte_tts.setMaximumHeight(110)
+        v14.addWidget(self.pte_tts, 0, 0, 1, 3)
+        v14.addWidget(QLabel("音色"), 1, 0)
+        self.cmb_tts_voice = QComboBox()
+        for _name, _v in tts_mod.VOICES:
+            self.cmb_tts_voice.addItem(_name)
+        v14.addWidget(self.cmb_tts_voice, 1, 1, 1, 2)
+        self.ed_tts_out = QLineEdit(); self.ed_tts_out.setPlaceholderText("输出 MP3 路径（留空自动命名到 tts_out\\）")
+        btn_tts_pick = QPushButton("浏览…"); btn_tts_pick.setFixedWidth(64)
+        v14.addWidget(self.ed_tts_out, 2, 0)
+        v14.addWidget(btn_tts_pick, 2, 1)
+        self.btn_tts = QPushButton("开始合成")
+        v14.addWidget(self.btn_tts, 3, 0, 1, 3)
+        f11.addWidget(g14)
+        f11.addStretch(1)
+        tabs.addTab(t11, "翻译 / TTS")
+
+        btn_tr_pick.clicked.connect(self._pick_tr_src)
+        btn_tr_cur.clicked.connect(self._tr_use_current)
+        self.btn_translate.clicked.connect(self.run_translate)
+        btn_tts_pick.clicked.connect(self._pick_tts_out)
+        self.btn_tts.clicked.connect(self.run_tts)
+
+        # Tab7 设置
+        t10 = QWidget()
+        f10 = QVBoxLayout(t10)
+        g12 = QGroupBox("语音识别（funasr / 魔塔）")
+        v12 = QGridLayout(g12)
+        v12.addWidget(QLabel("模型根目录"), 0, 0)
+        self.ed_model_dir = QLineEdit()
+        self.ed_model_dir.setPlaceholderText(r"如 D:\funasrModel（自动查找 hub\iic 下的模型）")
+        v12.addWidget(self.ed_model_dir, 0, 1)
+        btn_md = QPushButton("浏览…"); btn_md.setFixedWidth(64)
+        v12.addWidget(btn_md, 0, 2)
+        v12.addWidget(QLabel("运行设备"), 1, 0)
+        self.cmb_device = QComboBox(); self.cmb_device.addItems(["cpu", "cuda"])
+        v12.addWidget(self.cmb_device, 1, 1)
+        v12.addWidget(QLabel("分离模型目录"), 2, 0)
+        self.ed_demucs_dir = QLineEdit()
+        self.ed_demucs_dir.setPlaceholderText("可选：HDemucs 权重目录（留空用内置缓存）")
+        v12.addWidget(self.ed_demucs_dir, 2, 1)
+        btn_dm = QPushButton("浏览…"); btn_dm.setFixedWidth(64)
+        v12.addWidget(btn_dm, 2, 2)
+        f10.addWidget(g12)
+        g12b = QGroupBox("翻译 / TTS 服务（OpenAI 兼容：本地大模型或线上 API）")
+        v15 = QGridLayout(g12b)
+        v15.addWidget(QLabel("翻译后端"), 0, 0)
+        self.cmb_tr_backend = QComboBox()
+        self.cmb_tr_backend.addItems(["本地小模型（M2M100，离线）", "OpenAI 兼容大模型 API"])
+        v15.addWidget(self.cmb_tr_backend, 0, 1)
+        v15.addWidget(QLabel("TTS 后端"), 1, 0)
+        self.cmb_tts_backend = QComboBox()
+        self.cmb_tts_backend.addItems(["edge-tts（线上免费）", "OpenAI 兼容 TTS API"])
+        v15.addWidget(self.cmb_tts_backend, 1, 1)
+        v15.addWidget(QLabel("API Base URL"), 2, 0)
+        self.ed_api_base = QLineEdit()
+        self.ed_api_base.setPlaceholderText("本地: http://localhost:11434/v1 ｜ 线上: https://api.xxx.com/v1")
+        v15.addWidget(self.ed_api_base, 2, 1)
+        v15.addWidget(QLabel("API Key"), 3, 0)
+        self.ed_api_key = QLineEdit(); self.ed_api_key.setEchoMode(QLineEdit.Password)
+        v15.addWidget(self.ed_api_key, 3, 1)
+        v15.addWidget(QLabel("对话模型名"), 4, 0)
+        self.ed_api_model = QLineEdit(); self.ed_api_model.setPlaceholderText("如 qwen2.5:7b / gpt-4o-mini")
+        v15.addWidget(self.ed_api_model, 4, 1)
+        v15.addWidget(QLabel("翻译模型目录"), 5, 0)
+        self.ed_tr_model_dir = QLineEdit()
+        self.ed_tr_model_dir.setPlaceholderText("可选：M2M100 权重目录（留空自动下载）")
+        v15.addWidget(self.ed_tr_model_dir, 5, 1)
+        btn_trmdir = QPushButton("浏览…"); btn_trmdir.setFixedWidth(64)
+        v15.addWidget(btn_trmdir, 5, 2)
+        f10.addWidget(g12b)
+        self.btn_save_settings = QPushButton("保存设置")
+        f10.addWidget(self.btn_save_settings)
+        self.lbl_cfg_path = QLabel(f"配置文件: {config.CONFIG_PATH}")
+        f10.addWidget(self.lbl_cfg_path)
+        f10.addStretch(1)
+        tabs.addTab(t10, "设置")
+
+        btn_md.clicked.connect(self._pick_model_dir)
+        btn_dm.clicked.connect(self._pick_demucs_dir)
+        btn_trmdir.clicked.connect(self._pick_tr_model_dir)
+        self.btn_save_settings.clicked.connect(self.save_settings)
+
+        # ---- 底部：进度 + 日志（放在左栏底部）
+        self.bar = QProgressBar(); self.bar.setRange(0, 100); self.bar.setValue(0)
+        left.addWidget(self.bar)
+        self.log = QPlainTextEdit(); self.log.setReadOnly(True); self.log.setMaximumHeight(140)
+        left.addWidget(self.log)
+
+    def _connect(self):
+        self.btn_open.clicked.connect(self.open_file)
+        self.btn_play.clicked.connect(self.toggle_play)
+        self.btn_stop.clicked.connect(self.player.stop)
+        self.rate.currentTextChanged.connect(self._set_rate)
+        self.btn_slow.toggled.connect(self._slow_toggle)
+        self.btn_mark_in.clicked.connect(lambda: self._mark("in"))
+        self.btn_mark_out.clicked.connect(lambda: self._mark("out"))
+        self.btn_sel_clear.clicked.connect(self._clear_sel)
+        self.wave.clicked.connect(self._seek)
+        self.wave.selection_drawn.connect(self._drag_sel)
+        self.player.positionChanged.connect(self._pos_changed)
+        self.player.mediaStatusChanged.connect(lambda s: self.log_append(f"媒体状态: {s}") if s in (7, 8) else None)
+        self.player.errorOccurred.connect(lambda e, s: self.log_append(f"播放错误: {s}"))
+
+        self.btn_mute_sel.clicked.connect(self.mute_selection)
+        self.btn_cut_sel.clicked.connect(self.cut_selection)
+        self.btn_set_spk.clicked.connect(self.set_speaker_ref)
+        self.btn_set_feat.clicked.connect(self.set_feature_ref)
+
+        self.btn_apply_removal.clicked.connect(self.apply_removals)
+        self.btn_modelscope.clicked.connect(self.apply_modelscope_enhance)
+        self.btn_music_remove.clicked.connect(self.remove_background_music)
+        self.btn_split_fixed.clicked.connect(self.split_fixed)
+        self.btn_split_feat.clicked.connect(self.split_by_feature)
+        self.btn_split_kw.clicked.connect(self.split_keyword)
+        self.btn_merge_av.clicked.connect(self.merge_av)
+        self.btn_extract.clicked.connect(self.extract_audio)
+        self.btn_speed.clicked.connect(self.change_speed)
+        self.btn_trim.clicked.connect(self.trim_selection)
+        self.btn_text_remove.clicked.connect(self.remove_text_feature)
+        self.btn_sim_remove.clicked.connect(self.remove_similar_feature)
+        self.btn_feat_file.clicked.connect(self.import_feature_ref_file)
+
+    # ---------------------------------------------------------------- 工具
+    def log_append(self, msg: str):
+        self.log.appendPlainText(msg)
+
+    def out_path(self, suffix: str, ext: str | None = None) -> str:
+        base, e = os.path.splitext(self.src or "untitled")
+        return base + suffix + (ext or e)
+
+    def _pick_into(self, edit: QLineEdit, title: str, exts: set[str]):
+        f, _ = QFileDialog.getOpenFileName(self, f"选择{title}", "", "媒体文件 (*)")
+        if f:
+            edit.setText(f)
+
+    def _sel_range(self) -> tuple[float, float] | None:
+        s = self.wave.sel
+        if not s or s[1] - s[0] < 0.05:
+            QMessageBox.information(self, "提示", "请先标记/框选一个区间（标记开始/结束 或 在波形上拖拽）")
+            return None
+        return s
+
+    def _require_src(self) -> bool:
+        if not self.src:
+            QMessageBox.information(self, "提示", "请先打开音频或视频文件")
+            return False
+        return True
+
+    def _run(self, name: str, fn, *args, on_done=None, **kwargs):
+        if getattr(self, "_busy", False):
+            QMessageBox.information(self, "提示", "有任务正在进行中，请稍候")
+            return
+        self._busy = True
+        self._on_done_cb = on_done
+        self.bar.setValue(0)
+        self.statusBar().showMessage(f"执行中: {name}")
+        self.worker = Worker(name, fn, *args, **kwargs)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.done.connect(self._handle_done)
+        self.worker.failed.connect(self._handle_failed)
+        self.worker.start()
+
+    def _handle_done(self, tag: str, res):
+        self._busy = False
+        cb = getattr(self, "_on_done_cb", None)
+        if cb:
+            cb(res)
+        else:
+            self._default_done(tag, res)
+
+    def _handle_failed(self, tag: str, err: str):
+        self._busy = False
+        self._on_failed(tag, err)
+
+    def _on_progress(self, pct: int, msg: str):
+        self.bar.setValue(pct)
+        if msg:
+            self.statusBar().showMessage(msg)
+
+    def _on_failed(self, tag: str, err: str):
+        self.statusBar().showMessage(f"失败: {tag}")
+        self.log_append(f"[{tag}] 出错:\n{err}")
+        QMessageBox.critical(self, "任务失败", err.splitlines()[0][:300])
+
+    def _default_done(self, tag: str, res):
+        self.statusBar().showMessage(f"完成: {tag}")
+        out = None
+        if isinstance(res, dict):
+            out = res.get("output")
+            if res.get("report"):
+                self.log_append(f"[{tag}] 报告: {res['report']}")
+            if res.get("matched"):
+                self.log_append(f"[{tag}] 命中内容:\n" + "\n".join(res["matched"][:20]))
+        elif isinstance(res, str) and os.path.isfile(res):
+            out = res
+        elif isinstance(res, list):
+            self.log_append(f"[{tag}] 共输出 {len(res)} 个文件:\n" + "\n".join(res[:50]))
+        if out and os.path.isfile(out):
+            self._offer_load(out)
+
+    def _offer_load(self, path: str):
+        r = QMessageBox.question(self, "完成", f"已生成:\n{path}\n\n是否加载到播放器？",
+                                 QMessageBox.Yes | QMessageBox.No)
+        if r == QMessageBox.Yes:
+            self.load_file(path)
+
+    # ---------------------------------------------------------------- 打开/播放
+    def open_file(self):
+        f, _ = QFileDialog.getOpenFileName(self, "打开媒体", "", "媒体文件 (*)")
+        if f:
+            self.load_file(f)
+
+    def load_file(self, path: str):
+        self.player.stop()
+        self.src = os.path.abspath(path)
+        try:
+            self.info = ft.media_info(self.src)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "错误", f"读取媒体信息失败: {e}")
+            return
+        self.log_append(f"打开: {self.src}  ({self.info.duration:.2f}s, "
+                        f"视频={self.info.has_video}, 音频={self.info.has_audio})")
+        self.player.setSource(QUrl.fromLocalFile(self.src))
+        self.wave.clear_all()
+        self.wave.duration = self.info.duration
+        self.speaker_ref = None
+        self.feature_ref = None
+        self._mark_in = None
+        self._mark_out = None
+        self.ed_asr_src.setText(self.src)
+        self._load_waveform()
+        self._update_sel_label()
+
+    def _load_waveform(self):
+        if not self.src:
+            return
+        self.statusBar().showMessage("正在生成波形…")
+        self._run("波形", self._job_waveform, self.src, on_done=self._after_waveform)
+
+    @staticmethod
+    def _job_waveform(src: str, progress_cb=None):
+        return audio_ops.load_wav(src, 16000)
+
+    def _after_waveform(self, res):
+        y, sr = res
+        self.wave_sr = sr
+        self.wave_y = y
+        self.wave.set_data(y, sr, self.info.duration if self.info else len(y) / sr)
+        self.statusBar().showMessage("就绪")
+
+    def _pos_changed(self, ms: int):
+        self.wave.playhead = ms / 1000.0
+        d = self.player.duration()
+        if d > 0:
+            self.time_label.setText(
+                f"{self._fmt_ms(ms)} / {self._fmt_ms(d)}  [{self.rate.currentText()}]")
+        self.wave.update()
+
+    @staticmethod
+    def _fmt_ms(ms: int) -> str:
+        s = ms / 1000.0
+        return f"{int(s // 60):02d}:{s % 60:06.3f}"
+
+    def toggle_play(self):
+        if self.player.playbackState() == QMediaPlayer.PlayingState:
+            self.player.pause()
+            self.btn_play.setText("播放")
+        else:
+            self.player.play()
+            self.btn_play.setText("暂停")
+
+    def _set_rate(self, text: str):
+        r = float(text.rstrip("x"))
+        self.player.setPlaybackRate(r)
+        self.btn_slow.setChecked(r < 1.0)
+
+    def _slow_toggle(self, on: bool):
+        if on:
+            self._prev_rate = self.rate.currentText()
+            self.rate.setCurrentText("0.5x")
+        else:
+            self.rate.setCurrentText(getattr(self, "_prev_rate", "1x"))
+
+    def _seek(self, t: float):
+        self.player.setPosition(int(t * 1000))
+
+    def _mark(self, which: str):
+        t = self.player.position() / 1000.0
+        if which == "in":
+            self._mark_in = t
+        else:
+            self._mark_out = t
+        if getattr(self, "_mark_in", None) is not None and getattr(self, "_mark_out", None) is not None:
+            a, b = sorted((self._mark_in, self._mark_out))
+            if b - a > 0.05:
+                self.wave.sel = (a, b)
+                self._mark_in = self._mark_out = None
+        else:
+            cur = self.wave.sel or (t, t)
+            self.wave.sel = (t, cur[1]) if which == "in" else (cur[0], t)
+        self._update_sel_label()
+        self.wave.update()
+        self.log_append(f"标记{'开始' if which == 'in' else '结束'}: {t:.3f}s")
+
+    def _drag_sel(self, a: float, b: float):
+        self._update_sel_label()
+
+    def _clear_sel(self):
+        self.wave.sel = None
+        self._update_sel_label()
+        self.wave.update()
+
+    def _update_sel_label(self):
+        s = self.wave.sel
+        self.lbl_sel.setText(f"已选: {s[0]:.2f}s ~ {s[1]:.2f}s" if s else "未选择区间")
+
+    # ---------------------------------------------------------------- 区间操作
+    def mute_selection(self):
+        if not self._require_src():
+            return
+        r = self._sel_range()
+        if not r:
+            return
+        ext = ".mp4" if ft.is_video(self.src) else ".m4a"
+        out = self.out_path("_静音段", ext)
+        self._run("消音所选段", lambda src, o, s, e, progress_cb=None: ft.mute_ranges(src, o, [(s, e)]),
+                  self.src, out, r[0], r[1])
+
+    def cut_selection(self):
+        if not self._require_src():
+            return
+        r = self._sel_range()
+        if not r:
+            return
+        out = self.out_path(f"_片段{r[0]:.1f}-{r[1]:.1f}")
+        self._run("导出所选段", lambda src, o, s, e, progress_cb=None: ft.cut_range(src, o, s, e),
+                  self.src, out, r[0], r[1])
+
+    def set_speaker_ref(self):
+        r = self._sel_range()
+        if not r:
+            return
+        self.speaker_ref = r
+        self.wave.speaker_ref = r
+        self.wave.update()
+        self.log_append(f"说话人参考区间: {r[0]:.2f}~{r[1]:.2f}s")
+
+    def set_feature_ref(self):
+        r = self._sel_range()
+        if not r:
+            return
+        self.feature_ref = r
+        self.wave.feature_ref = r
+        self.wave.update()
+        self.log_append(f"相似特征参考区间: {r[0]:.2f}~{r[1]:.2f}s")
+
+    def import_feature_ref_file(self):
+        f, _ = QFileDialog.getOpenFileName(self, "选择参考音频", "", "音频文件 (*)")
+        if f:
+            self.feature_ref_file = f
+            self.lbl_feat_file.setText(os.path.basename(f))
+
+    # ---------------------------------------------------------------- 消除
+    def _selected_removals(self) -> list[str]:
+        return [k for k, cb in self.chk.items() if cb.isChecked()]
+
+    def apply_removals(self):
+        if not self._require_src():
+            return
+        kinds = self._selected_removals()
+        if not kinds:
+            QMessageBox.information(self, "提示", "请至少勾选一种要消除的声音")
+            return
+        if "speaker" in kinds and self.speaker_ref is None:
+            QMessageBox.information(self, "提示", "消除指定说话人前，请先播放并标记其声音区间，点击『设为说话人参考』")
+            return
+        strength = float(self.spin_strength.value())
+        thr = float(self.spin_spk_thr.value())
+        names = "+".join(dict(audio_ops.REMOVAL_TYPES)[k] for k in kinds)
+        out_wav = self.out_path(f"_消除_{names}", ".wav")
+        out = self.out_path(f"_消除_{names}")
+        self._run(f"消除({names})", self._job_removals, self.src, out, out_wav,
+                  kinds, strength, thr, self.speaker_ref, on_done=self._reload_wave)
+
+    def _reload_wave(self, res=None):
+        if res:
+            self._default_done("消除", res)
+        self._load_waveform()
+
+    @staticmethod
+    def _job_removals(src, out, out_wav, kinds, strength, thr, spk_ref, progress_cb=None):
+        def prog(p, m):
+            progress_cb(p, m)
+        y, sr = audio_ops.load_wav(src, 16000)
+        ref = None
+        if kinds and "speaker" in kinds and spk_ref is not None:
+            import soundfile as sf
+            tmp = out_wav + ".ref.wav"
+            ft.extract_audio(src, tmp, sr=16000, start=spk_ref[0], end=spk_ref[1])
+            ref, _ = sf.read(tmp, dtype="float32")
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        y2, report = audio_ops.process_removals(y, sr, kinds, strength,
+                                                speaker_ref=ref, speaker_threshold=thr,
+                                                progress=prog)
+        audio_ops.save_wav(out_wav, y2, sr)
+        if ft.is_video(src):
+            out = os.path.splitext(out)[0] + ".mp4"
+            ft.mux_replace_audio(src, out_wav, out)
+        else:
+            out = ft.encode_wav_to_media(out_wav, out)
+        return {"output": out, "report": report}
+
+    def apply_modelscope_enhance(self):
+        if not self._require_src():
+            return
+        out_wav = self.out_path("_魔塔增强", ".wav")
+        out = self.out_path("_魔塔增强")
+        self._run("魔塔增强", self._job_modelscope, self.src, out_wav, out)
+
+    @staticmethod
+    def _job_modelscope(src, out_wav, out, progress_cb=None):
+        progress_cb(5, "加载魔塔模型(首次需下载)…")
+        tmp = out_wav + ".in.wav"
+        ft.extract_audio(src, tmp, sr=16000, mono=True)
+        msa.modelscope_enhance(tmp, out_wav)
+        if ft.is_video(src):
+            out = os.path.splitext(out)[0] + ".mp4"
+            ft.mux_replace_audio(src, out_wav, out)
+        else:
+            out = ft.encode_wav_to_media(out_wav, out)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return out
+
+    # ---------------------------------------------------------------- 分割
+    def split_fixed(self):
+        if not self._require_src():
+            return
+        seg = float(self.spin_seg.value())
+        out_dir = self.out_path("_定长分割", "")
+        out_dir = os.path.splitext(out_dir)[0]
+        self._run("定长分割", lambda src, d, s, progress_cb=None: ft.split_fixed(src, d, s),
+                  self.src, out_dir, seg)
+
+    def split_by_feature(self):
+        if not self._require_src():
+            return
+        mode = self.cmb_feat_split.currentText()
+        if mode != "静音边界" and self.speaker_ref is None and mode == "说话人参考区间":
+            QMessageBox.information(self, "提示", "请先设置说话人参考区间")
+            return
+        if mode == "相似特征参考" and self.feature_ref is None and self.feature_ref_file is None:
+            QMessageBox.information(self, "提示", "请先设置相似特征参考区间或导入参考文件")
+            return
+        out_dir = os.path.splitext(self.out_path("_特征分割", ""))[0]
+        self._run("特征分割", self._job_split_feat, self.src, out_dir, mode,
+                  self.speaker_ref, self.feature_ref, self.feature_ref_file,
+                  float(self.spin_sim_thr.value()))
+
+    @staticmethod
+    def _job_split_feat(src, out_dir, mode, spk_ref, feat_ref, feat_file, sim_thr, progress_cb=None):
+        import soundfile as sf
+        y, sr = audio_ops.load_wav(src, 16000)
+        total = len(y) / sr
+        progress_cb(10, "分析特征…")
+        if mode == "静音边界":
+            ranges = features.detect_silence(y, sr)
+        elif mode == "说话人参考区间":
+            tmp = src + ".ref.wav"
+            ft.extract_audio(src, tmp, sr=16000, start=spk_ref[0], end=spk_ref[1])
+            ref, _ = sf.read(tmp, dtype="float32")
+            if ref.ndim > 1:
+                ref = ref.mean(axis=1)
+            ranges = features.find_similar_segments(y, sr, ref, sr, threshold=0.80)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        else:
+            if feat_file:
+                ref, rsr = sf.read(feat_file, dtype="float32")
+                if ref.ndim > 1:
+                    ref = ref.mean(axis=1)
+                if rsr != sr:
+                    n_new = int(len(ref) * sr / rsr)
+                    ref = np.interp(np.arange(n_new) / sr,
+                                    np.arange(len(ref)) / rsr, ref)
+            else:
+                tmp = src + ".feat.wav"
+                ft.extract_audio(src, tmp, sr=16000, start=feat_ref[0], end=feat_ref[1])
+                ref, _ = sf.read(tmp, dtype="float32")
+                if ref.ndim > 1:
+                    ref = ref.mean(axis=1)
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            ranges = features.find_similar_segments(y, sr, ref, sr, threshold=sim_thr)
+        bounds = features.segment_boundaries_from_ranges(ranges, total)
+        pieces = [(a, b) for a, b in zip(bounds[:-1], bounds[1:]) if b - a > 0.1]
+        progress_cb(40, f"共 {len(pieces)} 段，导出中…")
+        os.makedirs(out_dir, exist_ok=True)
+        outs = []
+        ext = os.path.splitext(src)[1] or ".mp4"
+        for i, (a, b) in enumerate(pieces):
+            o = os.path.join(out_dir, f"piece_{i + 1:04d}_{a:.2f}-{b:.2f}{ext}")
+            ft.cut_range(src, o, a, b)
+            outs.append(o)
+            progress_cb(40 + int(60 * (i + 1) / max(1, len(pieces))), f"导出 {i + 1}/{len(pieces)}")
+        return outs
+
+    # ---------------------------------------------------------------- 关键词/正则分割
+    _KW_KIND = {"以关键字开头分割": "head", "以关键字结束分割": "tail", "去掉关键字分割": "erase",
+                "正则前分割": "head", "正则后分割": "tail", "抹正则分割": "erase"}
+
+    def split_keyword(self):
+        if not self._require_src():
+            return
+        pat = self.ed_kw.text().strip()
+        if not pat:
+            QMessageBox.information(self, "提示", "请输入关键词或正则表达式")
+            return
+        mode = self.cmb_kw_mode.currentText()
+        if "正则" in mode:
+            try:
+                re.compile(pat)
+            except re.error as e:
+                QMessageBox.warning(self, "正则表达式错误", str(e))
+                return
+        if not msa.asr_available():
+            QMessageBox.warning(self, "缺少依赖",
+                                "关键词分割需要魔塔语音识别模型。\n\n请先执行:\n  uv sync --extra modelscope\n\n"
+                                f"模型: {msa.ASR_MODEL_ID}")
+            return
+        out_dir = os.path.splitext(self.out_path("_关键词分割", ""))[0]
+        self._run(f"关键词分割({mode})", self._job_split_keyword, self.src, out_dir, mode, pat,
+                  float(self.spin_kw_pb.value()), float(self.spin_kw_pa.value()))
+
+    @staticmethod
+    def _job_split_keyword(src, out_dir, mode, pattern, pad_b, pad_a, progress_cb=None):
+        progress_cb(5, "提取音频…")
+        wav = src + ".asr.wav"
+        ft.extract_audio(src, wav, sr=16000, mono=True)
+        try:
+            progress_cb(15, "语音识别中…")
+            words = msa.transcribe_words(wav)
+        finally:
+            try:
+                os.remove(wav)
+            except OSError:
+                pass
+        if not words:
+            return "未识别到语音内容，无法按关键词分割"
+        if "正则" in mode:
+            occ = msa.find_occurrences(words, pattern=pattern)
+        else:
+            occ = msa.find_occurrences(words, keyword=pattern)
+        if not occ:
+            return f"未找到匹配内容: {pattern}"
+        progress_cb(55, f"找到 {len(occ)} 处匹配，计算分割段…")
+        total = ft.media_info(src).duration
+        segs = msa.compute_split_segments(occ, total,
+                                          MainWindow._KW_KIND[mode], pad_b, pad_a)
+        if not segs:
+            return "分割结果为空（留白设置可能过大）"
+        os.makedirs(out_dir, exist_ok=True)
+        ext = os.path.splitext(src)[1] or ".mp4"
+        outs = []
+        for i, (a, b) in enumerate(segs):
+            o = os.path.join(out_dir, f"seg_{i + 1:03d}_{a:.2f}-{b:.2f}{ext}")
+            ft.cut_range(src, o, a, b)
+            outs.append(o)
+            progress_cb(60 + int(35 * (i + 1) / len(segs)), f"导出 {i + 1}/{len(segs)}")
+        occ_desc = "\n".join(f"  {s:.2f}s ~ {e:.2f}s  {t}" for s, e, t in occ[:30])
+        return {"output": outs[0],
+                "report": f"模式: {mode}；匹配 {len(occ)} 处；输出 {len(outs)} 段\n"
+                          f"输出目录: {out_dir}\n匹配位置:\n{occ_desc}"}
+
+    # ---------------------------------------------------------------- 合并 / 分离
+    def merge_av(self):
+        v, a = self.ed_video.text().strip(), self.ed_audio.text().strip()
+        if not (v and a and os.path.isfile(v) and os.path.isfile(a)):
+            QMessageBox.information(self, "提示", "请选择有效的视频与音频文件")
+            return
+        out = os.path.splitext(v)[0] + "_合并.mp4"
+        self._run("音视频合并", self._job_merge, v, a, out,
+                  float(self.spin_offset.value()), self.chk_shortest.isChecked())
+
+    @staticmethod
+    def _job_merge(v, a, out, offset, shortest, progress_cb=None):
+        return ft.merge_av(v, a, out, audio_offset=offset, use_shortest=shortest)
+
+    def extract_audio(self):
+        if not self._require_src():
+            return
+        out = self.out_path("_音频", ".wav")
+        sr = 16000 if self.chk_extract_16k.isChecked() else 48000
+        mono = self.chk_extract_16k.isChecked()
+        self._run("提取音频", lambda src, o, r, m, progress_cb=None: ft.extract_audio(src, o, sr=r, mono=m),
+                  self.src, out, sr, mono)
+
+    # ---------------------------------------------------------------- 时间轴
+    def change_speed(self):
+        if not self._require_src():
+            return
+        sp = float(self.spin_speed.value())
+        out = self.out_path(f"_x{sp:g}")
+        self._run("变速", lambda src, o, s, progress_cb=None: ft.change_speed(src, o, s),
+                  self.src, out, sp)
+
+    def trim_selection(self):
+        if not self._require_src():
+            return
+        r = self._sel_range()
+        if not r:
+            return
+        out = self.out_path(f"_裁剪{r[0]:.1f}-{r[1]:.1f}")
+        self._run("裁剪", lambda src, o, s, e, progress_cb=None: ft.cut_range(src, o, s, e),
+                  self.src, out, r[0], r[1])
+
+    # ---------------------------------------------------------------- 特征剔除
+    def remove_text_feature(self):
+        if not self._require_src():
+            return
+        kws = [k.strip() for k in self.ed_keywords.text().replace("，", ",").split(",") if k.strip()]
+        if not kws:
+            QMessageBox.information(self, "提示", "请输入关键词")
+            return
+        if not msa.asr_available():
+            QMessageBox.warning(self, "缺少依赖",
+                                "文字特征剔除需要魔塔语音识别模型。\n\n"
+                                "请先执行:\n  uv sync --extra modelscope\n\n"
+                                f"模型: {msa.ASR_MODEL_ID}（首次运行自动下载）")
+            return
+        mute = self.cmb_text_mode.currentText() == "静音该段"
+        out = self.out_path("_文字剔除")
+        self._run("文字特征剔除", self._job_text_remove, self.src, out, kws, mute)
+
+    @staticmethod
+    def _job_text_remove(src, out, kws, mute, progress_cb=None):
+        progress_cb(5, "提取音频…")
+        wav = src + ".asr.wav"
+        ft.extract_audio(src, wav, sr=16000, mono=True)
+        progress_cb(15, "语音识别中（首次需下载魔塔模型）…")
+        hits, matched = msa.find_keyword_segments(wav, kws)
+        try:
+            os.remove(wav)
+        except OSError:
+            pass
+        if not hits:
+            return "未发现包含关键词的内容"
+        progress_cb(60, f"命中 {len(hits)} 段，处理中…")
+        out = os.path.splitext(out)[0] + (".mp4" if ft.is_video(src) else ".m4a")
+        if mute:
+            ft.mute_ranges(src, out, hits)
+        else:
+            ft.remove_ranges(src, out, hits)
+        return {"output": out, "matched": matched}
+
+    def remove_similar_feature(self):
+        if not self._require_src():
+            return
+        if self.feature_ref is None and self.feature_ref_file is None:
+            QMessageBox.information(self, "提示", "请先『设为相似特征参考』或导入参考音频文件")
+            return
+        mute = self.cmb_sim_mode.currentText() == "静音该段"
+        thr = float(self.spin_sim_thr.value())
+        out = self.out_path("_相似剔除")
+        self._run("相似特征剔除", self._job_sim_remove, self.src, out,
+                  self.feature_ref, self.feature_ref_file, thr, mute)
+
+    @staticmethod
+    def _job_sim_remove(src, out, feat_ref, feat_file, thr, mute, progress_cb=None):
+        import soundfile as sf
+        progress_cb(10, "提取音频…")
+        y, sr = audio_ops.load_wav(src, 16000)
+        if feat_file:
+            ref, rsr = sf.read(feat_file, dtype="float32")
+            if ref.ndim > 1:
+                ref = ref.mean(axis=1)
+        else:
+            tmp = src + ".feat.wav"
+            ft.extract_audio(src, tmp, sr=16000, start=feat_ref[0], end=feat_ref[1])
+            ref, _ = sf.read(tmp, dtype="float32")
+            if ref.ndim > 1:
+                ref = ref.mean(axis=1)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        progress_cb(30, "相似特征检测…")
+        ranges = features.find_similar_segments(y, sr, ref, sr, threshold=thr)
+        if not ranges:
+            return "未发现相似特征内容"
+        progress_cb(60, f"命中 {len(ranges)} 段，处理中…")
+        out = os.path.splitext(out)[0] + (".mp4" if ft.is_video(src) else ".m4a")
+        if mute:
+            ft.mute_ranges(src, out, ranges)
+        else:
+            ft.remove_ranges(src, out, ranges)
+        return out
+
+    # ---------------------------------------------------------------- 语音转文字
+    def _pick_asr_src(self):
+        f, _ = QFileDialog.getOpenFileName(self, "选择要识别的文件", "", "媒体文件 (*)")
+        if f:
+            self.ed_asr_src.setText(f)
+
+    def _asr_use_current(self):
+        if not self._require_src():
+            return
+        self.ed_asr_src.setText(self.src)
+
+    def run_asr_export(self):
+        src = self.ed_asr_src.text().strip()
+        if not (src and os.path.isfile(src)):
+            QMessageBox.information(self, "提示", "请选择有效的音频或视频文件")
+            return
+        fmts = [name for name, chk in
+                (("txt", self.chk_out_txt), ("srt", self.chk_out_srt), ("lrc", self.chk_out_lrc))
+                if chk.isChecked()]
+        if not fmts:
+            QMessageBox.information(self, "提示", "请至少选择一种输出格式")
+            return
+        if not msa.asr_available():
+            QMessageBox.warning(self, "缺少依赖",
+                                "语音识别需要魔塔 ASR 模型。\n\n请先执行:\n  uv sync --extra modelscope\n\n"
+                                f"模型: {msa.ASR_MODEL_ID}（首次运行自动下载）")
+            return
+        base = os.path.splitext(src)[0]
+        self._run("语音识别导出", self._job_asr_export, src, base, fmts,
+                  on_done=self._after_asr_export)
+
+    @staticmethod
+    def _job_asr_export(src, base, fmts, progress_cb=None):
+        progress_cb(5, "提取音频…")
+        wav = src + ".asr.wav"
+        ft.extract_audio(src, wav, sr=16000, mono=True)
+        try:
+            progress_cb(15, "语音识别中（首次需下载魔塔模型，耗时较长）…")
+            sents = msa.transcribe_with_timestamps(wav)
+        finally:
+            try:
+                os.remove(wav)
+            except OSError:
+                pass
+        if not sents:
+            return "未识别到语音内容"
+        progress_cb(85, f"识别到 {len(sents)} 句，导出中…")
+        outs = []
+        if "txt" in fmts:
+            outs.append(msa.export_txt(sents, base + ".txt"))
+        if "srt" in fmts:
+            outs.append(msa.export_srt(sents, base + ".srt"))
+        if "lrc" in fmts:
+            outs.append(msa.export_lrc(sents, base + ".lrc", title=os.path.basename(base)))
+        preview = " ".join(s["text"].strip() for s in sents)[:300]
+        return {"report": f"共识别 {len(sents)} 句；生成 {len(outs)} 个文件:\n" + "\n".join(outs)
+                          + f"\n\n文本预览: {preview}"}
+
+    def _after_asr_export(self, res=None):
+        self._default_done("语音识别导出", res)
+
+    # ---------------------------------------------------------------- 去背景音乐
+    def remove_background_music(self):
+        if not self._require_src():
+            return
+        if not separation.available():
+            QMessageBox.warning(self, "缺少依赖",
+                                "人声/伴奏分离需要 torchaudio。\n\n请先执行:\n  uv sync --extra modelscope")
+            return
+        keep = float(self.spin_acc_keep.value())
+        acc_out = os.path.splitext(self.src)[0] + "_伴奏.wav" if self.chk_acc_out.isChecked() else None
+        self._run("去背景音乐", self._job_music_remove, self.src, keep, acc_out)
+
+    @staticmethod
+    def _job_music_remove(src, keep_ratio, acc_path, progress_cb=None):
+        base = os.path.splitext(src)[0]
+        tmp_wav = base + ".sep.wav"
+        voc_wav = base + "_人声.wav"
+        progress_cb(2, "提取音频（44.1kHz 立体声）…")
+        ft.extract_audio(src, tmp_wav, sr=44100, mono=False)
+        try:
+            separation.separate(tmp_wav, voc_wav, acc_path, keep_ratio, progress_cb)
+        finally:
+            try:
+                os.remove(tmp_wav)
+            except OSError:
+                pass
+        ext = os.path.splitext(src)[1].lower()
+        if ft.is_video(src):
+            out = base + "_去伴奏" + (ext or ".mp4")
+            ft.mux_replace_audio(src, voc_wav, out)
+        else:
+            out = base + "_去伴奏" + (ext or ".wav")
+            ft.encode_wav_to_media(voc_wav, out)
+        try:
+            os.remove(voc_wav)          # 中间产物不再需要
+        except OSError:
+            pass
+        return out
+
+    # ---------------------------------------------------------------- 音频翻译
+    def _pick_tr_src(self):
+        f, _ = QFileDialog.getOpenFileName(self, "选择要翻译的文件", "", "媒体文件 (*)")
+        if f:
+            self.ed_tr_src.setText(f)
+
+    def _tr_use_current(self):
+        if not self._require_src():
+            return
+        self.ed_tr_src.setText(self.src)
+
+    def run_translate(self):
+        src = self.ed_tr_src.text().strip()
+        if not (src and os.path.isfile(src)):
+            QMessageBox.information(self, "提示", "请选择有效的音频或视频文件")
+            return
+        pair = self.cmb_tr_pair.currentText()
+        if not msa.asr_available():
+            QMessageBox.warning(self, "缺少依赖",
+                                "音频翻译需要语音识别。\n\n请先执行:\n  uv sync --extra modelscope")
+            return
+        from . import config as _cfg
+        if _cfg.load_config().get("translate_backend", "local") == "local" \
+                and not translator.mt_available():
+            QMessageBox.warning(self, "缺少依赖",
+                                "本地翻译需要 transformers（M2M100 多语言模型）。\n\n"
+                                "请先执行:\n  uv sync --extra modelscope\n\n"
+                                "或到「设置」页改用 OpenAI 兼容大模型 API。")
+            return
+        self._run(f"音频翻译({pair})", self._job_translate, src, pair)
+
+    @staticmethod
+    def _job_translate(src, pair, progress_cb=None):
+        src_lang, tgt_lang = translator.PAIRS[pair]
+        progress_cb(3, "提取音频…")
+        wav = src + ".tr.wav"
+        ft.extract_audio(src, wav, sr=16000, mono=True)
+        try:
+            progress_cb(8, "语音识别中…")
+            sents = msa.transcribe_with_timestamps(wav)
+        finally:
+            try:
+                os.remove(wav)
+            except OSError:
+                pass
+        if not sents:
+            return "未识别到语音内容，无法翻译"
+        texts = [s.get("text", "").strip() for s in sents]
+        progress_cb(20, f"识别 {len(texts)} 句，开始翻译…")
+        trans = translator.translate(texts, src_lang, tgt_lang,
+                                     lambda p: progress_cb(20 + int(70 * p / 100)))
+        for s, t in zip(sents, trans):
+            s["trans"] = t
+        base = os.path.splitext(src)[0]
+        outs = [
+            translator.export_txt_bilingual(sents, base + ".翻译.txt"),
+            translator.export_srt_bilingual(sents, base + ".双语.srt"),
+            translator.export_lrc_bilingual(sents, base + ".双语.lrc",
+                                            title=os.path.basename(base)),
+        ]
+        preview = "\n".join(f"  {t} → {tr}" for t, tr in zip(texts[:5], trans[:5]))
+        return {"report": f"翻译方向: {pair}；共 {len(sents)} 句；生成:\n" + "\n".join(outs)
+                          + f"\n\n预览:\n{preview}"}
+
+    # ---------------------------------------------------------------- 文字转语音
+    def _pick_tts_out(self):
+        f, _ = QFileDialog.getSaveFileName(self, "选择输出位置", "tts_output.mp3",
+                                           "MP3 音频 (*.mp3)")
+        if f:
+            self.ed_tts_out.setText(f)
+
+    def run_tts(self):
+        text = self.pte_tts.toPlainText().strip()
+        if not text:
+            QMessageBox.information(self, "提示", "请输入要合成的文本")
+            return
+        out = self.ed_tts_out.text().strip()
+        if not out:
+            out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tts_out")
+            os.makedirs(out_dir, exist_ok=True)
+            import time as _time
+            out = os.path.join(out_dir, "tts_" + _time.strftime("%Y%m%d_%H%M%S") + ".mp3")
+        voice = tts_mod.VOICES[self.cmb_tts_voice.currentIndex()][1]
+        from . import config as _cfg
+        if _cfg.load_config().get("tts_backend", "edge") == "edge" \
+                and not tts_mod.edge_available():
+            QMessageBox.warning(self, "缺少依赖",
+                                "TTS 需要 edge-tts。\n\n请先执行:\n  uv sync --extra modelscope\n\n"
+                                "或到「设置」页改用 OpenAI 兼容 TTS API。")
+            return
+        self._run("文字转语音", self._job_tts, text, voice, out)
+
+    @staticmethod
+    def _job_tts(text, voice, out, progress_cb=None):
+        tts_mod.synth(text, out, voice, progress_cb)
+        return out
+
+    # ---------------------------------------------------------------- 设置
+    def _load_settings(self):
+        cfg = config.load_config()
+        self.ed_model_dir.setText(cfg.get("funasr_model_dir", ""))
+        self.cmb_device.setCurrentText(cfg.get("asr_device", "cpu"))
+        self.ed_demucs_dir.setText(cfg.get("demucs_model_dir", ""))
+        self.cmb_tr_backend.setCurrentIndex(1 if cfg.get("translate_backend") == "api" else 0)
+        self.cmb_tts_backend.setCurrentIndex(1 if cfg.get("tts_backend") == "api" else 0)
+        self.ed_api_base.setText(cfg.get("api_base", ""))
+        self.ed_api_key.setText(cfg.get("api_key", ""))
+        self.ed_api_model.setText(cfg.get("api_model", ""))
+        self.ed_tr_model_dir.setText(cfg.get("translate_model_dir", ""))
+
+    def _pick_model_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择 funasr 模型根目录",
+                                             self.ed_model_dir.text() or "")
+        if d:
+            self.ed_model_dir.setText(d)
+
+    def _pick_demucs_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择分离模型权重目录",
+                                             self.ed_demucs_dir.text() or "")
+        if d:
+            self.ed_demucs_dir.setText(d)
+
+    def _pick_tr_model_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择 M2M100 翻译模型目录",
+                                             self.ed_tr_model_dir.text() or "")
+        if d:
+            self.ed_tr_model_dir.setText(d)
+
+    def save_settings(self):
+        cfg = {"funasr_model_dir": self.ed_model_dir.text().strip(),
+               "asr_device": self.cmb_device.currentText(),
+               "demucs_model_dir": self.ed_demucs_dir.text().strip(),
+               "translate_backend": "api" if self.cmb_tr_backend.currentIndex() == 1 else "local",
+               "tts_backend": "api" if self.cmb_tts_backend.currentIndex() == 1 else "edge",
+               "api_base": self.ed_api_base.text().strip(),
+               "api_key": self.ed_api_key.text().strip(),
+               "api_model": self.ed_api_model.text().strip(),
+               "translate_model_dir": self.ed_tr_model_dir.text().strip()}
+        config.save_config(cfg)
+        msa.reset_pipeline()
+        self.log_append("设置已保存: 模型目录=" + cfg["funasr_model_dir"]
+                        + f", 设备={cfg['asr_device']}, 翻译后端={cfg['translate_backend']}"
+                        + f", TTS后端={cfg['tts_backend']}, API={cfg['api_base']}")
+        QMessageBox.information(self, "设置", "已保存，下次识别/翻译/合成时生效。")

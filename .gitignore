@@ -1,0 +1,40 @@
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+
+# Virtual env
+.venv/
+venv/
+env/
+ENV/
+
+# uv / pip
+.uv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 应用产物 / 临时（音频与输出）
+*.tr.wav
+*.asr.wav
+*.sep.wav
+tts_out/
+_test*.wav
+_test*.srt
+_test*.lrc
+_test*.txt
+_depcheck.py
+*.log

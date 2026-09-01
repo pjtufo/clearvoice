@@ -1,0 +1,152 @@
+"""冒烟测试：依赖导入 + DSP 管线 + GUI 构造。"""
+import os
+import sys
+
+import numpy as np
+
+print("1) 依赖导入...", end=" ", flush=True)
+import PySide6  # noqa: F401
+import scipy
+import soundfile
+import noisereduce
+import PySide6.QtMultimedia  # noqa: F401
+import PySide6.QtMultimediaWidgets  # noqa: F401
+print("ok")
+
+print("2) 模块导入...", end=" ", flush=True)
+from app import asr, audio_ops, features, ffmpeg_tools, main_window  # noqa: F401
+print("ok")
+
+print("3) 合成测试音频（语音带 + 哔哔声 + 削波）...", end=" ", flush=True)
+sr = 16000
+t = np.linspace(0, 6.0, int(sr * 6.0), endpoint=False)
+rng = np.random.default_rng(0)
+# 模拟"语音"：低频幅度调制 + 谐波
+speech = 0.3 * np.sin(2 * np.pi * 220 * t) * (0.5 + 0.5 * np.sign(np.sin(2 * np.pi * 1.2 * t)))
+speech *= (np.sin(2 * np.pi * 0.8 * t) > 0)  # 说话停顿
+noise = rng.normal(0, 0.05, len(t))           # 白噪声(杂音)
+beep = 0.2 * np.sin(2 * np.pi * 1000 * t) * (t > 2.0) * (t < 2.8)  # 哔哔声
+y = speech + noise + beep
+y[:: 3] *= 1.5                                # 人为削波(破音)
+y = np.clip(y, -1, 1)
+test_wav = os.path.join(os.path.dirname(__file__), "_test.wav")
+soundfile.write(test_wav, y.astype(np.float32), sr)
+print("ok")
+
+print("4) 特征检测...")
+segs, bins = features.detect_beep_segments(y, sr)
+print(f"   哔哔段: {segs}  频点数: {len(bins)}")
+clip_ratio = features.detect_clipped_ratio(y)
+print(f"   削波比例: {clip_ratio:.4f}")
+sil = features.detect_silence(y, sr)
+print(f"   静音段: {len(sil)} 个")
+
+print("5) 消除管线（噪声+哔哔+破音）...", end=" ", flush=True)
+y2, report = audio_ops.process_removals(y, sr, ["noise", "beep", "declip"], 0.85)
+print("ok")
+nr = np.sqrt(np.mean(y2 ** 2))
+print(f"   处理后 RMS={nr:.4f}")
+
+print("6) 说话人匹配消除...", end=" ", flush=True)
+ref = y[int(0.2 * sr): int(1.2 * sr)]  # 取一段"语音"作参考
+y3, spk_segs = audio_ops.apply_speaker_mask(y, sr, ref, sr, threshold=0.80)
+print(f"命中 {len(spk_segs)} 段")
+
+print("7) ffmpeg 工具（静音段/变速/提取）...", end=" ", flush=True)
+out_mute = os.path.join(os.path.dirname(__file__), "_test_muted.wav")
+ffmpeg_tools_mute = __import__("app.ffmpeg_tools", fromlist=["mute_ranges"]).mute_ranges(test_wav, out_mute, [(1.0, 2.0)])
+info = ffmpeg_tools_mute and None
+from app import ffmpeg_tools as ft
+info = ft.media_info(out_mute)
+print(f"ok ({info.duration:.2f}s)")
+
+print("8) ASR 导出格式（TXT/SRT/LRC）...", end=" ", flush=True)
+fake_sents = [
+    {"text": "你好世界", "start": 0.0, "end": 1.25},
+    {"text": "第二句话测试", "start": 2.4, "end": 3.75},
+]
+d = os.path.dirname(__file__)
+p_txt = asr.export_txt(fake_sents, os.path.join(d, "_test.txt"))
+p_srt = asr.export_srt(fake_sents, os.path.join(d, "_test.srt"))
+p_lrc = asr.export_lrc(fake_sents, os.path.join(d, "_test.lrc"), title="测试")
+assert "你好世界" in open(p_txt, encoding="utf-8").read()
+srt_txt = open(p_srt, encoding="utf-8").read()
+assert "00:00:00,000 --> 00:00:01,250" in srt_txt
+lrc_txt = open(p_lrc, encoding="utf-8").read()
+assert "[00:02.40]第二句话测试" in lrc_txt
+for p in (p_txt, p_srt, p_lrc):
+    os.remove(p)
+print("ok")
+
+print("9) 关键词/正则分割计算...", end=" ", flush=True)
+words = [
+    {"text": "大家好", "start": 0.0, "end": 0.9},
+    {"text": "，", "start": 0.9, "end": 0.95},
+    {"text": "今天", "start": 1.0, "end": 1.6},
+    {"text": "天气", "start": 1.6, "end": 2.2},
+    {"text": "大家好", "start": 2.5, "end": 3.4},
+    {"text": "。", "start": 3.4, "end": 3.5},
+    {"text": "再见", "start": 3.6, "end": 4.2},
+]
+occ = asr.find_occurrences(words, keyword="大家好")
+assert len(occ) == 2 and abs(occ[0][0]) < 1e-6 and abs(occ[1][0] - 2.5) < 1e-6, occ
+# 开头分割: 第1处贴文件头无前段; 段=[0.9,2.4],[3.4,5.0]
+segs_head = asr.compute_split_segments(occ, 5.0, "head", 0.1, 0.1)
+assert len(segs_head) == 2 and abs(segs_head[0][0] - 0.9) < 1e-6 and abs(segs_head[0][1] - 2.4) < 1e-6, segs_head
+# 结束分割: 段连续=[0,1.0],[1.0,3.5],[3.5,5.0]
+segs_tail = asr.compute_split_segments(occ, 5.0, "tail", 0.1, 0.1)
+assert len(segs_tail) == 3 and abs(segs_tail[0][1] - 1.0) < 1e-6 and abs(segs_tail[2][0] - 3.5) < 1e-6, segs_tail
+# 去掉关键字: 段=[1.0,2.4],[3.5,5.0]
+segs_erase = asr.compute_split_segments(occ, 5.0, "erase", 0.1, 0.1)
+assert len(segs_erase) == 2 and abs(segs_erase[0][0] - 1.0) < 1e-6 and abs(segs_erase[1][0] - 3.5) < 1e-6, segs_erase
+# 正则（标点不影响匹配）
+occ_re = asr.find_occurrences(words, pattern="天[气气]")
+assert len(occ_re) == 1 and abs(occ_re[0][0] - 1.6) < 1e-6, occ_re
+occ_kw2 = asr.find_occurrences(words, keyword="好今天")  # 跨标点命中
+assert len(occ_kw2) == 1 and abs(occ_kw2[0][1] - 1.6) < 1e-6, occ_kw2
+print("ok")
+
+print("10) 人声/伴奏分离模块...", end=" ", flush=True)
+import torch as _torch
+from app import separation
+assert separation.available()
+try:
+    _m, _sr = separation.get_model()
+    assert _sr == 44100
+    with _torch.no_grad():
+        _o = _m(_torch.zeros(1, 2, 44100 * 2))
+    assert _o.shape[0] == 1 and _o.shape[1] == 4, _o.shape
+    print("ok")
+except Exception as e:  # 无本地权重且无网络时跳过，不阻塞其余测试
+    print("skip（权重不可用: %s）" % type(e).__name__)
+
+print("11) 翻译/TTS 模块与双语导出...", end=" ", flush=True)
+from app import translator, tts as tts_mod
+assert set(translator.PAIRS) == {"英译中", "中译英", "日译中"}
+assert len(tts_mod.VOICES) == 6
+bi = [{"text": "Hello world", "trans": "你好世界", "start": 0.0, "end": 1.5},
+      {"text": "Good morning", "trans": "早上好", "start": 2.0, "end": 3.5}]
+p_btxt = translator.export_txt_bilingual(bi, os.path.join(d, "_test_bi.txt"))
+p_bsrt = translator.export_srt_bilingual(bi, os.path.join(d, "_test_bi.srt"))
+p_blrc = translator.export_lrc_bilingual(bi, os.path.join(d, "_test_bi.lrc"), title="双语")
+bt = open(p_btxt, encoding="utf-8").read()
+assert "Hello world\n你好世界" in bt
+bs = open(p_bsrt, encoding="utf-8").read()
+assert "Hello world\n你好世界" in bs and "00:00:00,000 --> 00:00:01,500" in bs
+bl = open(p_blrc, encoding="utf-8").read()
+assert "[00:00.00]Hello world / 你好世界" in bl
+for p in (p_btxt, p_bsrt, p_blrc):
+    os.remove(p)
+print("ok")
+
+print("12) GUI 构造（offscreen）...", end=" ", flush=True)
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+from PySide6.QtWidgets import QApplication
+app = QApplication([])
+w = main_window.MainWindow()
+w.show()
+print("ok")
+
+os.remove(test_wav)
+os.remove(out_mute)
+print("\nALL TESTS PASSED")

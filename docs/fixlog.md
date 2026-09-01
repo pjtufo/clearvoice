@@ -1,0 +1,182 @@
+# ClearVoice Fixlog（修复与变更记录）
+
+格式：`[日期] 类别 | 问题 → 原因 → 修复`。每轮修改后均以 `smoke_test.py` 全量回归验证。
+
+---
+
+## 2026-08-31 首轮开发（基础功能）
+
+### [2026-08-31] 环境 | uv 不在 PATH
+
+- **问题**：`uv --version` 报「不是内部或外部命令」。
+- **原因**：uv 未安装，PowerShell 会话 PATH 不含用户安装目录。
+- **修复**：官方安装脚本安装 uv（`--user` 级别），实际落盘 `C:\Users\FXAQ_PJT\.local\bin\uv.exe`；
+  调用时使用绝对路径。
+
+### [2026-08-31] 环境 | uv 安装权限被拒
+
+- **问题**：uv 安装脚本写系统目录失败。
+- **修复**：以 `--user` 方式安装到用户目录。
+
+### [2026-08-31] 环境 | PowerShell 执行策略阻止脚本
+
+- **问题**：执行任意 `.ps1` 报「running scripts is disabled on this system」。
+- **原因**：系统执行策略为 Restricted。
+- **修复**：工具链调用改用 `Bypass`；注意该策略只影响 profile/包装脚本加载（无害告警），
+  程序自身与 ffmpeg 调用不受影响。
+
+### [2026-08-31] 环境 | 依赖安装网络失败
+
+- **问题**：uv 从默认源拉取 PySide6/numpy 等超时。
+- **修复**：切换清华镜像 `UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple`。
+
+### [2026-08-31] 算法 | 说话人相似度匹配失效
+
+- **问题**：同一个人前后说话，MFCC 相似度曲线无峰，消除命中 0 段。
+- **原因**：MFCC 对通道/录音条件敏感，参考片段与目标片段均值不统一。
+- **修复**：特征改为 **log-mel 谱 + CMN 归一化**（整段频点均值扣除，参考投影到同一空间）；
+  `features.similarity_curve` 重写为该方案。
+
+### [2026-08-31] 算法 | 余弦相似度数值偏低
+
+- **问题**：同人相似度仅 0.3~0.5，默认阈值下漏检。
+- **原因**：参考片段过短时窗均值退化；静音窗拉低分数。
+- **修复**：
+  - 参考窗长自适应：参考 < 1.5s 时按 `ref_dur/4` 缩短窗长（下限 0.12s）；
+  - 参考端仅取能量前 60% 的窗参与均值；
+  - 目标端能量低于峰值 6dB 的静音帧相似度置 -1；
+  - 阈值整定：说话人消除 0.70、相似特征剔除 0.78、特征分割 0.80（界面可调）。
+
+### [2026-08-31] 测试 | GUI 无法在无显示环境验证
+
+- **修复**：冒烟测试使用 `QT_QPA_PLATFORM=offscreen` 构造 MainWindow，CI/脚本环境可跑。
+
+---
+
+## 2026-09-01 语音识别（转写与导出）
+
+### [2026-09-01] 功能 | ASR 依赖缺失
+
+- **问题**：文字特征剔除/识别功能无依赖可用（venv 中无 funasr/modelscope/torch）。
+- **修复**：`uv sync --extra modelscope`（清华镜像）安装 funasr + modelscope + torch 2.13 + torchaudio，
+  耗时约 20 分钟（torch 体积大），安装完成 PySide6 6.9.3 等原依赖未被破坏。
+
+### [2026-09-01] 变更 | 导出任务完成时误弹「加载到播放器」
+
+- **问题**：识别导出返回 dict 含 `output` 时会对 txt 文件弹播放器加载确认。
+- **修复**：识别导出返回值只含 `report`（不含 `output`），`_default_done` 不再询问加载。
+
+### [2026-09-01] 健壮性 | 临时 wav 清理
+
+- **问题**：识别中途抛异常时 `src.asr.wav` 临时文件残留。
+- **修复**：`try/finally` 中删除临时文件（`_job_asr_export`、`_job_split_keyword` 等）。
+
+---
+
+## 2026-09-01 关键词/正则分割与设置页
+
+### [2026-09-01] 变更 | ASR 模型 ID 与本地模型不匹配
+
+- **问题**：原配置 `iic/speech_paraformer-large_asr_nat-…` 在用户本地 `D:\funasrModel` 不存在，
+  按原逻辑会触发在线下载（约 1GB）。
+- **原因**：本地已有的是 **SeACo-Paraformer** 版本（`speech_seaco_paraformer_large_asr_nat-…`）。
+- **修复**：`ASR_MODEL_ID` 更换为 SeACo 模型；新增 `_local()` 本地解析，
+  按 `<根>/<模型名>`、`<根>/hub/iic/<模型名>`、`<根>/iic/<模型名>` 探测 `config.yaml`，
+  命中即完全离线加载。已验证 ASR/VAD/标点三个模型全部命中本地目录。
+
+### [2026-09-01] 设计 | 关键词匹配受 ASR 标点干扰
+
+- **问题**：接入标点模型后，关键词「大家好」可能因中间标点/多字 token 匹配失败或定位偏差。
+- **修复**：
+  - `transcribe_words` 滤除纯标点 token；
+  - `find_occurrences` 在**去标点连接文本**上匹配，字符位置经 `idx` 映射回词级时间戳，
+    跨标点命中（如「大家好，今天」查「好今天」）且时间精确到字级。
+
+### [2026-09-01] 健壮性 | 标点模型加载失败导致整个识别不可用
+
+- **修复**：`get_asr()` 先带 `punc_model` 加载，异常时自动去掉标点模型重试一次（无标点降级）。
+
+### [2026-09-01] 边界 | 分割段碎片化
+
+- **问题**：留白过大或匹配过密时产生 <50ms 碎段、甚至起止倒挂。
+- **修复**：`compute_split_segments` 用游标推进并 `max(cur, …)` 防回退，过滤 <50ms 段；
+  结果为空时给用户明确提示（「留白设置可能过大」）。
+
+### [2026-09-01] 输入校验 | 非法正则导致后台任务崩溃
+
+- **修复**：正则模式下提交前 `re.compile` 预检，失败弹窗提示，不进入任务线程。
+
+---
+
+## 2026-09-01 去背景音乐（人声/伴奏分离）
+
+### [2026-09-01] 选型 | 分离模型来源
+
+- **背景**：需专用人声/伴奏分离模型。魔搭有 `DiffSynth-Studio/Demucs-Repackage`（facebook Demucs 魔搭转存）。
+- **决策**：采用 **torchaudio 内置 `HDEMUCS_HIGH_MUSDB_PLUS`**（MUSDB18-HQ 高质量权重，44.1k 立体声、4 音轨）。
+  原因：零新增 pip 依赖（demucs 包 / DiffSynth-Studio 均需引入额外依赖树）；
+  权重已预下载缓存至 `~/.cache/torch/hub/torchaudio/models/hdemucs_high_trained.pt`（319MB），此后离线。
+  魔搭 Demucs-Repackage 权重仍可通过「设置→分离模型目录」接入（放置转换后的权重文件）。
+
+### [2026-09-01] 兼容 | torchaudio 2.11 load/save 需要 torchcodec
+
+- **问题**：`torchaudio.load/save` 报 `ImportError: TorchCodec is required`。
+  （torchaudio 2.9 起媒体 IO 后端切换为 torchcodec，venv 中未安装。）
+- **修复**：`separation.separate` 改用 **soundfile** 读写 WAV（项目已有依赖），
+  仅保留 `torchaudio.functional.resample`（纯张量运算，无后端依赖）。
+  该问题由端到端验证暴露（冒烟测试第 10 项只做模型 forward，未覆盖 IO）。
+
+### [2026-09-01] 新增 | 去背景音乐功能
+
+- 新模块 `app/separation.py`：HDemucs 分块推理（10s 窗 / 75% 跳步 / 线性交叠加权融合），
+  长音频内存恒定；输出 = 人声 + 可调伴奏保留比例；可选同时输出伴奏文件。
+- 界面：「消除杂音」页新增「去背景音乐」分组；「设置」页新增「分离模型目录」。
+- 验证：冒烟测试 11 项全过；端到端（合成人声+和弦音频 → 分离 → mp3 编码）通过，
+  6 秒音频 CPU 耗时约 10 秒。
+
+### [2026-09-01] 测试 | 冒烟测试扩至 11 项
+
+- 第 10 项：分离模块（模型加载 + 2 秒前向，断言 4 音轨输出形状）；
+  权重不可用环境下降级为 skip，不阻塞其余测试。GUI 构造顺延为第 11 项。
+
+---
+
+## 2026-09-02 音频翻译与文字转语音
+
+### [2026-09-02] 新增 | 音频翻译（英译中 / 中译英 / 日译中）
+
+- 新模块 `app/translator.py`：语音识别（句级时间戳）→ 逐句翻译 → 双语导出
+  （`<源>.翻译.txt` 双语对照 / `<源>.双语.srt` 双语字幕 / `<源>.双语.lrc` 双语歌词）。
+- 双后端：本地 M2M100（`facebook/m2m100_418M`，HF 镜像自动下载或设置页指定权重目录，完全离线）/
+  OpenAI 兼容 chat API（`api_base` 指向本地 Ollama 或线上服务均可）。
+- 双语 SRT/LRC 导出复用 `asr._fmt_srt` / `asr._fmt_lrc`，时间轴与识别结果一致。
+
+### [2026-09-02] 新增 | 文字转语音（中 / 英 / 粤）
+
+- 新模块 `app/tts.py`：6 个音色（中文普通话 x2、英语 x2、粤语 x2），输出 MP3，
+  留空路径自动命名到 `tts_out\`。
+- 双后端：edge-tts（微软线上免费，需联网）/ OpenAI 兼容 `/v1/audio/speech` 接口。
+
+### [2026-09-02] 变更 | 依赖与配置扩展
+
+- `pyproject.toml`：modelscope extra 增加 `transformers`、`edge-tts`；base 增加 `requests`。
+- `config.py` DEFAULTS 新增 `translate_backend`、`translate_model_dir`、`tts_backend`、
+  `tts_api_model`、`api_base`、`api_key`、`api_model`。
+- 界面：新增「翻译 / TTS」页签；「设置」页新增「翻译 / TTS 服务」分组（后端切换、
+  API 参数、M2M100 权重目录）。
+
+### [2026-09-02] 测试 | 冒烟测试扩至 12 项
+
+- 第 11 项：翻译/TTS 模块断言（语言对、音色表）+ 双语 TXT/SRT/LRC 导出内容校验（纯逻辑离线）；
+  GUI 构造顺延为第 12 项。2026-09-02 全部通过。
+
+---
+
+## 回归基线
+
+`smoke_test.py` 当前 12 项（2026-09-02 全过）：
+
+1. 依赖导入 → 2. 模块导入 → 3. 合成测试音频 → 4. 特征检测（哔哔/削波/静音）
+   → 5. 消除管线 → 6. 说话人匹配 → 7. ffmpeg 工具 → 8. ASR 导出格式（TXT/SRT/LRC）
+   → 9. 关键词/正则分割计算（三种策略断言 + 跨标点命中）→ 10. 人声/伴奏分离（HDemucs 前向）
+   → 11. 翻译/TTS 模块与双语导出 → 12. GUI offscreen 构造。
