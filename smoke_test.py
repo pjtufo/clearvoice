@@ -214,6 +214,54 @@ from app.ffmpeg_tools import _parse_fps
 assert abs(_parse_fps("30000/1001") - 29.97) < 0.01 and _parse_fps("0/0") == 0.0
 print("ok")
 
+print("13) 文件/目录批处理（扫描/结构保持/重命名）...", end=" ", flush=True)
+import shutil
+import tempfile
+from app import filetools as ftools
+# 文件名变换四种模式（对齐 xrename.bat）
+assert ftools.transform_stem("abcdefg", "replace", find="cd", repl="XY") == "abXYefg"
+assert ftools.transform_stem("abcdefg", "replace", find="cd", repl="") == "abefg"
+assert ftools.transform_stem("abcdefg", "keep", n=2, m=3) == "cde"
+assert ftools.transform_stem("abcdefg", "keep", n=0, m=-2) == "abcde"
+assert ftools.transform_stem("abcdefg", "lcut", m=3) == "defg"
+assert ftools.transform_stem("abcdefg", "cut", n=2, m=4) == "abefg"
+assert ftools.truncate_stem("abcdefghij", 4) == "abcd"
+td = tempfile.mkdtemp(prefix="cv_ft_")
+try:
+    os.makedirs(os.path.join(td, "sub1"))
+    os.makedirs(os.path.join(td, "sub2"))
+    for p in ("sub1/a.mp3", "sub1/b.wav", "sub2/c.mp3", "root.mp4", "note.txt"):
+        open(os.path.join(td, p.replace("/", os.sep)), "w").close()
+    files = ftools.scan_inputs([td], ftools.MEDIA_EXTS, recursive=True)
+    assert sorted(os.path.basename(f) for f in files) == ["a.mp3", "b.wav", "c.mp3", "root.mp4"]
+    flat = ftools.scan_inputs([td], ftools.MEDIA_EXTS, recursive=False)
+    assert sorted(os.path.basename(f) for f in flat) == ["root.mp4"]
+    src = os.path.join(td, "sub1", "a.mp3")
+    out = ftools.plan_output(src, td, os.path.join(td, "out"), ext=".wav", keep_structure=True)
+    assert os.path.normpath(out) == os.path.normpath(os.path.join(td, "out", "sub1", "a.wav"))
+    assert os.path.isdir(os.path.join(td, "out", "sub1"))
+    out2 = ftools.plan_output(src, td, os.path.join(td, "out2"), ext=".wav", keep_structure=False)
+    assert os.path.normpath(out2) == os.path.normpath(os.path.join(td, "out2", "a.wav"))
+    longsrc = os.path.join(td, "sub2", "abcdefghijklmnop.mp3")
+    o3 = ftools.plan_output(longsrc, td, os.path.join(td, "out3"), ext=".mp3", max_name_len=5)
+    assert os.path.basename(o3) == "abcde.mp3"
+    open(o3, "w").close()
+    o4 = ftools.plan_output(longsrc, td, os.path.join(td, "out3"), ext=".mp3", max_name_len=5)
+    assert os.path.basename(o4) == "abcde_1.mp3"
+    t1 = os.path.join(td, "r1.mp3"); t2 = os.path.join(td, "r2.mp3"); t3 = os.path.join(td, "x.mp3")
+    for p in (t1, t2, t3):
+        open(p, "w").close()
+    plan = ftools.plan_rename([t1, t2, t3], "replace", find="r", repl="rr")
+    st = {os.path.basename(p["old"]): p["status"] for p in plan}
+    assert st["r1.mp3"] == "ok" and st["r2.mp3"] == "ok" and st["x.mp3"] == "skip"
+    assert ftools.plan_rename([t3], "lcut", m=5)[0]["status"] == "skip"  # 空名保护
+    done, failed = ftools.apply_rename([p for p in plan if p["status"] == "ok"])
+    assert done == 2 and not failed
+    assert os.path.isfile(os.path.join(td, "rr1.mp3")) and os.path.isfile(os.path.join(td, "rr2.mp3"))
+    print("ok")
+finally:
+    shutil.rmtree(td, ignore_errors=True)
+
 os.remove(test_wav)
 os.remove(out_mute)
 print("\nALL TESTS PASSED")

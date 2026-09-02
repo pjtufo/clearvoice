@@ -1,9 +1,10 @@
 """ClearVoice 主界面（PySide6）。
 
-功能页签：消除杂音（多类型 DSP + 去背景音乐）/ 分割（定长/特征/关键词正则）/
-合并分离 / 格式转换（批量视频转音频·音频转音频）/ 时间轴（变速 / 音画同步微调 / 裁剪）/
+功能页签：消除杂音（多类型 DSP + 去背景音乐）/ 分割（定长/特征/关键词正则，输出子目录可选）/
+合并分离 / 格式转换（批量·目录递归·保持结构）/ 文件名夹处理（批量重命名）/
+时间轴（变速 / 音画同步微调 / 裁剪）/
 特征剔除 / 语音转文字 / 翻译 / TTS / 设置。
-左栏：播放控制、波形选区、说话人与特征参考标记、进度与日志。
+左栏：播放控制、波形选区（含可拖拽概览条）、说话人与特征参考标记、进度与日志。
 """
 from __future__ import annotations
 
@@ -21,7 +22,7 @@ from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QWidget, QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QPushButton, QFileDialog, QComboBox,
-    QCheckBox, QDoubleSpinBox, QTabWidget, QPlainTextEdit,
+    QCheckBox, QDoubleSpinBox, QSpinBox, QTabWidget, QPlainTextEdit,
     QProgressBar, QMessageBox, QLineEdit, QGroupBox, QSizePolicy,
     QListWidget,
 )
@@ -692,6 +693,20 @@ class MainWindow(QMainWindow):
         h3b.addWidget(self.btn_split_kw)
         v3b.addLayout(h3b)
         f2.addWidget(g3b)
+        g3c = QGroupBox("分割输出选项")
+        v3c = QVBoxLayout(g3c)
+        self.chk_split_subdir = QCheckBox("为每个源文件创建子目录（按源文件名，分段文件放入其中）")
+        self.chk_split_subdir.setChecked(True)
+        v3c.addWidget(self.chk_split_subdir)
+        h3c = QHBoxLayout()
+        self.chk_split_namelen = QCheckBox("限制分段文件名长度（主干字符数，0=不限）")
+        self.spin_split_namelen = QSpinBox(); self.spin_split_namelen.setRange(0, 200)
+        self.spin_split_namelen.setValue(0); self.spin_split_namelen.setSingleStep(10)
+        h3c.addWidget(self.chk_split_namelen)
+        h3c.addWidget(self.spin_split_namelen)
+        h3c.addStretch(1)
+        v3c.addLayout(h3c)
+        f2.addWidget(g3c)
         f2.addStretch(1)
         tabs.addTab(t2, "分割")
 
@@ -732,32 +747,43 @@ class MainWindow(QMainWindow):
         # Tab 格式转换（批量：视频转音频 / 音频转音频）
         tconv = QWidget()
         fconv = QVBoxLayout(tconv)
-        gconv = QGroupBox("批量格式转换（视频转音频 / 音频转音频）")
+        gconv = QGroupBox("批量格式转换（视频转音频 / 音频转音频，支持文件与目录）")
         vconv = QGridLayout(gconv)
         self.lst_convert = QListWidget()
-        self.lst_convert.setMinimumHeight(120)
+        self.lst_convert.setMinimumHeight(100)
         self.lst_convert.setSelectionMode(QListWidget.ExtendedSelection)
         vconv.addWidget(self.lst_convert, 0, 0, 1, 3)
         self.btn_conv_add = QPushButton("添加文件…")
+        self.btn_conv_adddir = QPushButton("添加目录…")
         self.btn_conv_del = QPushButton("移除所选")
         self.btn_conv_clr = QPushButton("清空")
         vconv.addWidget(self.btn_conv_add, 1, 0)
-        vconv.addWidget(self.btn_conv_del, 1, 1)
-        vconv.addWidget(self.btn_conv_clr, 1, 2)
-        vconv.addWidget(QLabel("输出格式"), 2, 0)
+        vconv.addWidget(self.btn_conv_adddir, 1, 1)
+        vconv.addWidget(self.btn_conv_del, 1, 2)
+        vconv.addWidget(self.btn_conv_clr, 2, 0)
+        self.chk_conv_recurse = QCheckBox("递归子目录"); self.chk_conv_recurse.setChecked(True)
+        vconv.addWidget(self.chk_conv_recurse, 2, 1)
+        self.chk_conv_keepstruct = QCheckBox("输出保持相对目录结构"); self.chk_conv_keepstruct.setChecked(True)
+        vconv.addWidget(self.chk_conv_keepstruct, 2, 2)
+        vconv.addWidget(QLabel("输出根目录"), 3, 0)
+        self.ed_conv_outroot = QLineEdit(); self.ed_conv_outroot.setPlaceholderText("留空 = 输出到源文件同目录")
+        btn_conv_outroot = QPushButton("浏览…"); btn_conv_outroot.setFixedWidth(64)
+        vconv.addWidget(self.ed_conv_outroot, 3, 1)
+        vconv.addWidget(btn_conv_outroot, 3, 2)
+        vconv.addWidget(QLabel("输出格式"), 4, 0)
         self.cmb_conv_fmt = QComboBox()
         for _ext, _desc in ft.AUDIO_OUT_FORMATS.items():
             self.cmb_conv_fmt.addItem(f"{_desc}（*{_ext}）", _ext)
-        vconv.addWidget(self.cmb_conv_fmt, 2, 1, 1, 2)
-        vconv.addWidget(QLabel("码率"), 3, 0)
+        vconv.addWidget(self.cmb_conv_fmt, 4, 1, 1, 2)
+        vconv.addWidget(QLabel("码率"), 5, 0)
         self.cmb_conv_br = QComboBox()
         self.cmb_conv_br.setEditable(True)
         self.cmb_conv_br.addItems(["源 / 默认", "128k", "192k", "256k", "320k"])
-        vconv.addWidget(self.cmb_conv_br, 3, 1, 1, 2)
-        vconv.addWidget(QLabel("采样率"), 4, 0)
+        vconv.addWidget(self.cmb_conv_br, 5, 1, 1, 2)
+        vconv.addWidget(QLabel("采样率"), 6, 0)
         self.cmb_conv_sr = QComboBox()
         self.cmb_conv_sr.addItems(["源", "8000", "16000", "22050", "32000", "44100", "48000"])
-        vconv.addWidget(self.cmb_conv_sr, 4, 1, 1, 2)
+        vconv.addWidget(self.cmb_conv_sr, 6, 1, 1, 2)
         h_den = QHBoxLayout()
         self.chk_conv_denoise = QCheckBox("启用降噪（强度）")
         self.spin_conv_denoise = QDoubleSpinBox()
@@ -766,16 +792,79 @@ class MainWindow(QMainWindow):
         h_den.addWidget(self.chk_conv_denoise)
         h_den.addWidget(self.spin_conv_denoise)
         h_den.addStretch(1)
-        vconv.addLayout(h_den, 5, 0, 1, 3)
+        vconv.addLayout(h_den, 7, 0, 1, 3)
+        h_name = QHBoxLayout()
+        self.chk_conv_namelen = QCheckBox("限制输出文件名长度（主干字符数，0=不限）")
+        self.spin_conv_namelen = QSpinBox(); self.spin_conv_namelen.setRange(0, 200)
+        self.spin_conv_namelen.setValue(0); self.spin_conv_namelen.setSingleStep(10)
+        h_name.addWidget(self.chk_conv_namelen)
+        h_name.addWidget(self.spin_conv_namelen)
+        h_name.addStretch(1)
+        vconv.addLayout(h_name, 8, 0, 1, 3)
         self.btn_convert = QPushButton("开始转换")
-        vconv.addWidget(self.btn_convert, 6, 0, 1, 3)
-        lbl_conv_tip = QLabel("输出到源文件同目录，文件名为 <源名>.<格式>（同名时自动加 _转换 后缀）；"
-                              "码率/采样率默认跟随源文件。")
+        vconv.addWidget(self.btn_convert, 9, 0, 1, 3)
+        lbl_conv_tip = QLabel("添加目录时递归穷举子目录中的音视频文件；输出在根目录下按源相对路径"
+                              "重建目录结构；同名文件自动加序号；码率/采样率默认跟随源。")
         lbl_conv_tip.setWordWrap(True)
-        vconv.addWidget(lbl_conv_tip, 7, 0, 1, 3)
+        vconv.addWidget(lbl_conv_tip, 10, 0, 1, 3)
         fconv.addWidget(gconv)
         fconv.addStretch(1)
         tabs.addTab(tconv, "格式转换")
+        btn_conv_outroot.clicked.connect(
+            lambda: self._pick_dir_into(self.ed_conv_outroot, "选择输出根目录"))
+
+        # Tab 文件名/夹处理（批量重命名，对齐 xrename.bat）
+        trn = QWidget()
+        frn = QVBoxLayout(trn)
+        grn = QGroupBox("批量文件名处理（字符串替换 / 保留子串 / 左切除 / 中间切除）")
+        vrn = QGridLayout(grn)
+        vrn.addWidget(QLabel("源目录"), 0, 0)
+        self.ed_rn_dir = QLineEdit(); self.ed_rn_dir.setPlaceholderText("选择要批量重命名文件所在的目录")
+        btn_rn_dir = QPushButton("浏览…"); btn_rn_dir.setFixedWidth(64)
+        vrn.addWidget(self.ed_rn_dir, 0, 1)
+        vrn.addWidget(btn_rn_dir, 0, 2)
+        self.chk_rn_recurse = QCheckBox("递归子目录"); self.chk_rn_recurse.setChecked(True)
+        vrn.addWidget(self.chk_rn_recurse, 1, 0)
+        vrn.addWidget(QLabel("扩展名过滤（如 mp3,wav；空=全部）"), 1, 1)
+        self.ed_rn_exts = QLineEdit(); self.ed_rn_exts.setPlaceholderText("mp3,wav,m4a")
+        vrn.addWidget(self.ed_rn_exts, 1, 2)
+        vrn.addWidget(QLabel("处理模式"), 2, 0)
+        self.cmb_rn_mode = QComboBox()
+        self.cmb_rn_mode.addItems(["字符串替换（查找→替换）",
+                                   "保留子串 keep（从第 n 位起保留 m 位，m 负=到倒数）",
+                                   "左切除 lcut（去掉前 m 位）",
+                                   "中间切除 cut（删除第 n 到 m 位）"])
+        vrn.addWidget(self.cmb_rn_mode, 2, 1, 1, 2)
+        vrn.addWidget(QLabel("查找串"), 3, 0)
+        self.ed_rn_find = QLineEdit()
+        vrn.addWidget(self.ed_rn_find, 3, 1)
+        self.ed_rn_repl = QLineEdit(); self.ed_rn_repl.setPlaceholderText("替换串（可空=删除）")
+        vrn.addWidget(self.ed_rn_repl, 3, 2)
+        vrn.addWidget(QLabel("起始位 n（0 基）"), 4, 0)
+        self.spin_rn_n = QSpinBox(); self.spin_rn_n.setRange(-999, 999); self.spin_rn_n.setValue(0)
+        vrn.addWidget(self.spin_rn_n, 4, 1)
+        vrn.addWidget(QLabel("长度/位置 m（keep 负=到倒数|m|位）"), 4, 2)
+        self.spin_rn_m = QSpinBox(); self.spin_rn_m.setRange(-999, 999); self.spin_rn_m.setValue(0)
+        h_rn = QHBoxLayout()
+        self.chk_rn_index = QCheckBox("重名自动加序号"); self.chk_rn_index.setChecked(True)
+        h_rn.addWidget(self.chk_rn_index)
+        self.chk_rn_namelen = QCheckBox("结果名超长截断（主干字符数，0=不限）")
+        self.spin_rn_namelen = QSpinBox(); self.spin_rn_namelen.setRange(0, 200); self.spin_rn_namelen.setValue(0)
+        h_rn.addWidget(self.chk_rn_namelen); h_rn.addWidget(self.spin_rn_namelen)
+        h_rn.addStretch(1)
+        vrn.addLayout(h_rn, 5, 0, 1, 3)
+        h_rn_btn = QHBoxLayout()
+        self.btn_rn_preview = QPushButton("预览（不执行）")
+        self.btn_rn_apply = QPushButton("执行重命名")
+        h_rn_btn.addWidget(self.btn_rn_preview); h_rn_btn.addWidget(self.btn_rn_apply)
+        h_rn_btn.addStretch(1)
+        vrn.addLayout(h_rn_btn, 6, 0, 1, 3)
+        self.pte_rn = QPlainTextEdit(); self.pte_rn.setPlaceholderText("预览结果：旧文件名 → 新文件名")
+        self.pte_rn.setReadOnly(True)
+        vrn.addWidget(self.pte_rn, 7, 0, 1, 3)
+        frn.addWidget(grn)
+        tabs.addTab(trn, "文件名/夹处理")
+        btn_rn_dir.clicked.connect(lambda: self._pick_dir_into(self.ed_rn_dir, "选择源目录"))
 
         # Tab4 时间轴
         t4 = QWidget()
@@ -1019,9 +1108,12 @@ class MainWindow(QMainWindow):
         self.btn_merge_av.clicked.connect(self.merge_av)
         self.btn_extract.clicked.connect(self.extract_audio)
         self.btn_conv_add.clicked.connect(self._conv_add_files)
+        self.btn_conv_adddir.clicked.connect(self._conv_add_dir)
         self.btn_conv_del.clicked.connect(self._conv_del_selected)
         self.btn_conv_clr.clicked.connect(self.lst_convert.clear)
         self.btn_convert.clicked.connect(self.convert_media_batch)
+        self.btn_rn_preview.clicked.connect(self.rename_preview)
+        self.btn_rn_apply.clicked.connect(self.rename_apply)
         self.btn_speed.clicked.connect(self.change_speed)
         self.btn_av_preview.clicked.connect(self.preview_av_sync)
         self.btn_av_restore.clicked.connect(self.restore_av_preview)
@@ -1043,6 +1135,11 @@ class MainWindow(QMainWindow):
         f, _ = QFileDialog.getOpenFileName(self, f"选择{title}", "", "媒体文件 (*)")
         if f:
             edit.setText(f)
+
+    def _pick_dir_into(self, edit: QLineEdit, title: str):
+        d = QFileDialog.getExistingDirectory(self, title, "")
+        if d:
+            edit.setText(os.path.abspath(d))
 
     def _sel_range(self) -> tuple[float, float] | None:
         s = self.wave.sel
@@ -1358,14 +1455,31 @@ class MainWindow(QMainWindow):
         return out
 
     # ---------------------------------------------------------------- 分割
+    def _split_targets(self, kind: str) -> tuple[str, str]:
+        """按分割输出选项返回 (输出目录, 文件名前缀)。
+
+        勾选子目录：<src目录>/<源文件名>_<kind>分割/，前缀为空；
+        不勾选：输出到源目录，前缀为 <源文件名>_（避免多文件混淆）。
+        """
+        from . import filetools
+        stem = os.path.splitext(os.path.basename(self.src or ""))[0]
+        name_len = int(self.spin_split_namelen.value()) if self.chk_split_namelen.isChecked() else 0
+        stem = filetools.truncate_stem(stem, name_len) if name_len else stem
+        src_dir = os.path.dirname(os.path.abspath(self.src))
+        if self.chk_split_subdir.isChecked():
+            return os.path.join(src_dir, f"{stem}_{kind}分割"), ""
+        return src_dir, f"{stem}_"
+
     def split_fixed(self):
         if not self._require_src():
             return
         seg = float(self.spin_seg.value())
-        out_dir = self.out_path("_定长分割", "")
-        out_dir = os.path.splitext(out_dir)[0]
-        self._run("定长分割", lambda src, d, s, progress_cb=None: ft.split_fixed(src, d, s),
-                  self.src, out_dir, seg)
+        out_dir, prefix = self._split_targets("定长")
+        os.makedirs(out_dir, exist_ok=True)
+        base = f"{prefix}part" if prefix else "part"
+        self._run("定长分割",
+                  lambda src, d, s, b, progress_cb=None: ft.split_fixed(src, d, s, base=b),
+                  self.src, out_dir, seg, base)
 
     def split_by_feature(self):
         if not self._require_src():
@@ -1377,13 +1491,14 @@ class MainWindow(QMainWindow):
         if mode == "相似特征参考" and self.feature_ref is None and self.feature_ref_file is None:
             QMessageBox.information(self, "提示", "请先设置相似特征参考区间或导入参考文件")
             return
-        out_dir = os.path.splitext(self.out_path("_特征分割", ""))[0]
+        out_dir, prefix = self._split_targets("特征")
         self._run("特征分割", self._job_split_feat, self.src, out_dir, mode,
                   self.speaker_ref, self.feature_ref, self.feature_ref_file,
-                  float(self.spin_sim_thr.value()))
+                  float(self.spin_sim_thr.value()), prefix)
 
     @staticmethod
-    def _job_split_feat(src, out_dir, mode, spk_ref, feat_ref, feat_file, sim_thr, progress_cb=None):
+    def _job_split_feat(src, out_dir, mode, spk_ref, feat_ref, feat_file, sim_thr,
+                        prefix="", progress_cb=None):
         import soundfile as sf
         y, sr = audio_ops.load_wav(src, 16000)
         total = len(y) / sr
@@ -1428,7 +1543,7 @@ class MainWindow(QMainWindow):
         outs = []
         ext = os.path.splitext(src)[1] or ".mp4"
         for i, (a, b) in enumerate(pieces):
-            o = os.path.join(out_dir, f"piece_{i + 1:04d}_{a:.2f}-{b:.2f}{ext}")
+            o = os.path.join(out_dir, f"{prefix}piece_{i + 1:04d}_{a:.2f}-{b:.2f}{ext}")
             ft.cut_range(src, o, a, b)
             outs.append(o)
             progress_cb(40 + int(60 * (i + 1) / max(1, len(pieces))), f"导出 {i + 1}/{len(pieces)}")
@@ -1457,12 +1572,13 @@ class MainWindow(QMainWindow):
                                 "关键词分割需要魔塔语音识别模型。\n\n请先执行:\n  uv sync --extra modelscope\n\n"
                                 f"模型: {msa.ASR_MODEL_ID}")
             return
-        out_dir = os.path.splitext(self.out_path("_关键词分割", ""))[0]
+        out_dir, prefix = self._split_targets("关键词")
         self._run(f"关键词分割({mode})", self._job_split_keyword, self.src, out_dir, mode, pat,
-                  float(self.spin_kw_pb.value()), float(self.spin_kw_pa.value()))
+                  float(self.spin_kw_pb.value()), float(self.spin_kw_pa.value()), prefix)
 
     @staticmethod
-    def _job_split_keyword(src, out_dir, mode, pattern, pad_b, pad_a, progress_cb=None):
+    def _job_split_keyword(src, out_dir, mode, pattern, pad_b, pad_a,
+                           prefix="", progress_cb=None):
         progress_cb(5, "提取音频…")
         wav = src + ".asr.wav"
         ft.extract_audio(src, wav, sr=16000, mono=True)
@@ -1492,7 +1608,7 @@ class MainWindow(QMainWindow):
         ext = os.path.splitext(src)[1] or ".mp4"
         outs = []
         for i, (a, b) in enumerate(segs):
-            o = os.path.join(out_dir, f"seg_{i + 1:03d}_{a:.2f}-{b:.2f}{ext}")
+            o = os.path.join(out_dir, f"{prefix}seg_{i + 1:03d}_{a:.2f}-{b:.2f}{ext}")
             ft.cut_range(src, o, a, b)
             outs.append(o)
             progress_cb(60 + int(35 * (i + 1) / len(segs)), f"导出 {i + 1}/{len(segs)}")
@@ -1533,18 +1649,26 @@ class MainWindow(QMainWindow):
             if f not in existing:
                 self.lst_convert.addItem(f)
 
+    def _conv_add_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择媒体目录（递归扫描子目录）", "")
+        if d:
+            d = os.path.abspath(d)
+            existing = {self.lst_convert.item(i).text() for i in range(self.lst_convert.count())}
+            if d not in existing:
+                self.lst_convert.addItem(d)
+
     def _conv_del_selected(self):
         for item in self.lst_convert.selectedItems():
             self.lst_convert.takeItem(self.lst_convert.row(item))
 
     def convert_media_batch(self):
-        files = [self.lst_convert.item(i).text() for i in range(self.lst_convert.count())]
-        if not files:
-            QMessageBox.information(self, "提示", "请先添加要转换的媒体文件")
+        inputs = [self.lst_convert.item(i).text() for i in range(self.lst_convert.count())]
+        if not inputs:
+            QMessageBox.information(self, "提示", "请先添加要转换的媒体文件或目录")
             return
-        missing = [f for f in files if not os.path.isfile(f)]
+        missing = [p for p in inputs if not os.path.exists(p)]
         if missing:
-            QMessageBox.warning(self, "提示", "以下文件不存在：\n" + "\n".join(missing[:5]))
+            QMessageBox.warning(self, "提示", "以下路径不存在：\n" + "\n".join(missing[:5]))
             return
         fmt = self.cmb_conv_fmt.currentData() or ".mp3"
         br_txt = self.cmb_conv_br.currentText().strip()
@@ -1555,17 +1679,26 @@ class MainWindow(QMainWindow):
         except ValueError:
             sr = None
         denoise = float(self.spin_conv_denoise.value()) if self.chk_conv_denoise.isChecked() else 0.0
-        self._run("格式转换", self._job_convert, files, fmt, bitrate, sr, denoise)
+        out_root = self.ed_conv_outroot.text().strip()
+        recurse = self.chk_conv_recurse.isChecked()
+        keep_struct = self.chk_conv_keepstruct.isChecked()
+        name_len = int(self.spin_conv_namelen.value()) if self.chk_conv_namelen.isChecked() else 0
+        self._run("格式转换", self._job_convert, inputs, fmt, bitrate, sr, denoise,
+                  out_root, recurse, keep_struct, name_len)
 
     @staticmethod
-    def _job_convert(files, fmt, bitrate, sr, denoise, progress_cb=None):
+    def _job_convert(inputs, fmt, bitrate, sr, denoise,
+                     out_root, recurse, keep_struct, name_len, progress_cb=None):
+        from . import filetools
+        files = filetools.scan_inputs(inputs, filetools.MEDIA_EXTS, recursive=recurse)
+        if not files:
+            return {"output": "", "report": "未在所选路径中找到可转换的音视频文件"}
+        root = filetools.source_root(inputs)
         outs = []
         n = len(files)
         for i, src in enumerate(files):
-            base, _ = os.path.splitext(src)
-            dst = base + fmt
-            if os.path.abspath(dst) == os.path.abspath(src):
-                dst = base + "_转换" + fmt  # 同格式转码避免覆盖源文件
+            dst = filetools.plan_output(src, root, out_root, ext=fmt,
+                                        keep_structure=keep_struct, max_name_len=name_len)
             progress_cb(int(95 * i / n), f"转换 {i + 1}/{n}: {os.path.basename(src)}")
             ft.convert_media(src, dst, bitrate=bitrate, sr=sr, denoise=denoise)
             outs.append(dst)
@@ -1573,6 +1706,77 @@ class MainWindow(QMainWindow):
         return {"output": outs[0],
                 "report": f"共转换 {n} 个文件（格式 {fmt}，码率 {bitrate or '默认'}，"
                           f"采样率 {sr or '源'}，降噪 {denoise:g}）:\n" + "\n".join(outs)}
+
+    # ---------------------------------------------------------------- 文件名/夹处理
+    _RN_MODES = ["replace", "keep", "lcut", "cut"]
+
+    def _rn_collect(self) -> tuple[list[str], dict]:
+        from . import filetools
+        d = self.ed_rn_dir.text().strip()
+        if not d or not os.path.isdir(d):
+            QMessageBox.information(self, "提示", "请先选择有效的源目录")
+            return [], {}
+        ext_txt = self.ed_rn_exts.text().strip().lower()
+        exts = None
+        if ext_txt:
+            exts = {("." + e.strip().lstrip(".")) for e in ext_txt.replace("，", ",").split(",") if e.strip()}
+        files = filetools.scan_inputs([d], exts, recursive=self.chk_rn_recurse.isChecked())
+        mode = self._RN_MODES[self.cmb_rn_mode.currentIndex()]
+        params = dict(mode=mode, n=int(self.spin_rn_n.value()), m=int(self.spin_rn_m.value()),
+                      find=self.ed_rn_find.text(), repl=self.ed_rn_repl.text(),
+                      max_name_len=int(self.spin_rn_namelen.value()) if self.chk_rn_namelen.isChecked() else 0,
+                      auto_index=self.chk_rn_index.isChecked())
+        return files, params
+
+    def rename_preview(self):
+        files, params = self._rn_collect()
+        if not files:
+            self.pte_rn.setPlainText("未找到匹配的文件")
+            return
+        if params["mode"] == "replace" and not params["find"]:
+            QMessageBox.information(self, "提示", "字符串替换模式需要填写「查找串」")
+            return
+        from . import filetools
+        plan = filetools.plan_rename(files, **params)
+        ok = [p for p in plan if p["status"] == "ok"]
+        lines = [f"共 {len(plan)} 个文件，将重命名 {len(ok)} 个：", ""]
+        for p in plan:
+            if p["status"] == "ok":
+                lines.append(f"{os.path.basename(p['old'])}  →  {os.path.basename(p['new'])}")
+            else:
+                lines.append(f"[跳过] {os.path.basename(p['old'])}  （{p['note']}）")
+        self.pte_rn.setPlainText("\n".join(lines))
+
+    def rename_apply(self):
+        files, params = self._rn_collect()
+        if not files:
+            return
+        if params["mode"] == "replace" and not params["find"]:
+            QMessageBox.information(self, "提示", "字符串替换模式需要填写「查找串」")
+            return
+        from . import filetools
+        plan = filetools.plan_rename(files, **params)
+        ok_n = sum(1 for p in plan if p["status"] == "ok")
+        if ok_n == 0:
+            QMessageBox.information(self, "提示", "没有需要重命名的文件（请先预览查看）")
+            return
+        if QMessageBox.question(self, "确认", f"将重命名 {ok_n} 个文件，是否继续？") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        self._run("批量重命名", self._job_rename, plan)
+
+    @staticmethod
+    def _job_rename(plan, progress_cb=None):
+        from . import filetools
+        done, failed = filetools.apply_rename(plan, progress_cb)
+        progress_cb(100, "重命名完成")
+        lines = [f"成功 {done} 个" + (f"，跳过/失败 {len(failed)} 个：" if failed else "："), ""]
+        for p in plan:
+            if p["status"] == "ok":
+                lines.append(f"{os.path.basename(p['old'])}  →  {os.path.basename(p['new'])}")
+            else:
+                lines.append(f"[跳过] {os.path.basename(p['old'])}  （{p['note']}）")
+        return {"output": plan[0]["new"] if plan else "", "report": "\n".join(lines)}
 
     # ---------------------------------------------------------------- 时间轴
     def change_speed(self):
