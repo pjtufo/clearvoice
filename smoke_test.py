@@ -67,6 +67,13 @@ try:
     raise SystemExit("偏移 0 应报错")
 except Exception:
     pass
+# 分离音频多格式表（保留原始采样率/声道）
+assert {".wav", ".flac", ".mp3", ".m4a", ".ogg", ".opus"} <= set(ft.AUDIO_OUT_FORMATS)
+try:
+    ft.extract_audio_keep(out_mute, os.path.join(os.path.dirname(__file__), "_x.wma"))
+    raise SystemExit("不支持的格式应报错")
+except Exception:
+    pass
 print(f"ok ({info.duration:.2f}s)")
 
 print("8) ASR 导出格式（TXT/SRT/LRC）...", end=" ", flush=True)

@@ -115,6 +115,33 @@ def extract_audio(src: str, dst_wav: str, sr: int = 16000, mono: bool = True, st
     return dst_wav
 
 
+# 分离音频可选输出格式：扩展名 -> (ffmpeg 编码参数, 说明)
+# 不指定 -ar/-ac，保留源文件原始采样率与声道数。
+AUDIO_OUT_FORMATS: dict[str, tuple[list[str], str]] = {
+    ".wav":  (["-c:a", "pcm_s16le"], "WAV 无损 PCM"),
+    ".flac": (["-c:a", "flac"], "FLAC 无损压缩"),
+    ".mp3":  (["-c:a", "libmp3lame", "-q:a", "2"], "MP3 高品质 VBR"),
+    ".m4a":  (["-c:a", "aac", "-b:a", "192k"], "M4A / AAC 192k"),
+    ".aac":  (["-c:a", "aac", "-b:a", "192k"], "AAC 192k"),
+    ".ogg":  (["-c:a", "libvorbis", "-q:a", "5"], "OGG Vorbis"),
+    ".opus": (["-c:a", "libopus", "-b:a", "128k"], "OPUS 128k（编解码标准固定 48kHz）"),
+}
+
+
+def extract_audio_keep(src: str, dst: str) -> str:
+    """分离音频并保留源文件的原始采样率/声道数（不重采样、不下混）。
+
+    输出格式由 dst 扩展名决定（见 AUDIO_OUT_FORMATS）。
+    """
+    ext = os.path.splitext(dst)[1].lower()
+    codec = AUDIO_OUT_FORMATS.get(ext)
+    if codec is None:
+        raise FFmpegError(f"不支持的音频输出格式: {ext}（支持: {', '.join(AUDIO_OUT_FORMATS)}）")
+    args = [FFMPEG, "-y", "-v", "error", "-i", src, "-vn", *codec[0], dst]
+    run(args)
+    return dst
+
+
 def mux_replace_audio(video: str, wav: str, out: str, align: str = "shortest", audio_offset: float = 0.0) -> str:
     """把处理后的音频与原视频合成。video 流直接 copy，音频编码 aac。
 

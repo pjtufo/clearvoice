@@ -557,14 +557,15 @@ class MainWindow(QMainWindow):
         btn_v.clicked.connect(lambda: self._pick_into(self.ed_video, "视频", ft.VIDEO_EXTS))
         btn_a.clicked.connect(lambda: self._pick_into(self.ed_audio, "音频", ft.AUDIO_EXTS))
         f3.addWidget(g4)
-        g5 = QGroupBox("分离音频")
-        v5 = QVBoxLayout(g5)
-        self.btn_extract = QPushButton("从当前文件提取音频(WAV)")
-        v5.addWidget(self.btn_extract)
-        f5 = QHBoxLayout()
-        self.chk_extract_16k = QCheckBox("16kHz 单声道（默认）"); self.chk_extract_16k.setChecked(True)
-        f5.addWidget(self.chk_extract_16k)
-        v5.addLayout(f5)
+        g5 = QGroupBox("分离音频（保留视频原始采样率 / 声道）")
+        v5 = QGridLayout(g5)
+        v5.addWidget(QLabel("输出格式"), 0, 0)
+        self.cmb_extract_fmt = QComboBox()
+        for _ext, (_args, _desc) in ft.AUDIO_OUT_FORMATS.items():
+            self.cmb_extract_fmt.addItem(f"{_desc}（*{_ext}）", _ext)
+        v5.addWidget(self.cmb_extract_fmt, 0, 1)
+        self.btn_extract = QPushButton("从当前文件分离音频")
+        v5.addWidget(self.btn_extract, 1, 0, 1, 2)
         f3.addWidget(g5)
         f3.addStretch(1)
         tabs.addTab(t3, "合并 / 分离")
@@ -1306,11 +1307,11 @@ class MainWindow(QMainWindow):
     def extract_audio(self):
         if not self._require_src():
             return
-        out = self.out_path("_音频", ".wav")
-        sr = 16000 if self.chk_extract_16k.isChecked() else 48000
-        mono = self.chk_extract_16k.isChecked()
-        self._run("提取音频", lambda src, o, r, m, progress_cb=None: ft.extract_audio(src, o, sr=r, mono=m),
-                  self.src, out, sr, mono)
+        ext = self.cmb_extract_fmt.currentData() or ".wav"
+        out = self.out_path("_音频", ext)
+        self._run("分离音频",
+                  lambda src, o, progress_cb=None: ft.extract_audio_keep(src, o),
+                  self.src, out)
 
     # ---------------------------------------------------------------- 时间轴
     def change_speed(self):
