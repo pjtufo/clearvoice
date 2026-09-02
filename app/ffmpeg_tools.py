@@ -115,17 +115,34 @@ def extract_audio(src: str, dst_wav: str, sr: int = 16000, mono: bool = True, st
     return dst_wav
 
 
-# 分离音频可选输出格式：扩展名 -> (ffmpeg 编码参数, 说明)
-# 不指定 -ar/-ac，保留源文件原始采样率与声道数。
-AUDIO_OUT_FORMATS: dict[str, tuple[list[str], str]] = {
-    ".wav":  (["-c:a", "pcm_s16le"], "WAV 无损 PCM"),
-    ".flac": (["-c:a", "flac"], "FLAC 无损压缩"),
-    ".mp3":  (["-c:a", "libmp3lame", "-q:a", "2"], "MP3 高品质 VBR"),
-    ".m4a":  (["-c:a", "aac", "-b:a", "192k"], "M4A / AAC 192k"),
-    ".aac":  (["-c:a", "aac", "-b:a", "192k"], "AAC 192k"),
-    ".ogg":  (["-c:a", "libvorbis", "-q:a", "5"], "OGG Vorbis"),
-    ".opus": (["-c:a", "libopus", "-b:a", "128k"], "OPUS 128k（编解码标准固定 48kHz）"),
+# 分离/转换音频可选输出格式：扩展名 -> 说明
+# 不指定 -ar/-ac 时保留源文件原始采样率与声道数。
+AUDIO_OUT_FORMATS: dict[str, str] = {
+    ".wav":  "WAV 无损 PCM",
+    ".flac": "FLAC 无损压缩",
+    ".mp3":  "MP3 高品质",
+    ".m4a":  "M4A / AAC",
+    ".aac":  "AAC",
+    ".ogg":  "OGG Vorbis",
+    ".opus": "OPUS（编解码标准固定 48kHz）",
 }
+
+
+def _audio_codec_args(ext: str, bitrate: str | None = None) -> list[str]:
+    """按扩展名返回音频编码参数；bitrate 非空时覆盖默认码率（无损格式忽略）。"""
+    if ext == ".wav":
+        return ["-c:a", "pcm_s16le"]
+    if ext == ".flac":
+        return ["-c:a", "flac"]
+    if ext == ".mp3":
+        return ["-c:a", "libmp3lame", "-b:a", bitrate] if bitrate else ["-c:a", "libmp3lame", "-q:a", "2"]
+    if ext in (".m4a", ".aac"):
+        return ["-c:a", "aac", "-b:a", bitrate or "192k"]
+    if ext == ".ogg":
+        return ["-c:a", "libvorbis", "-b:a", bitrate] if bitrate else ["-c:a", "libvorbis", "-q:a", "5"]
+    if ext == ".opus":
+        return ["-c:a", "libopus", "-b:a", bitrate or "128k"]
+    raise FFmpegError(f"不支持的音频输出格式: {ext}（支持: {', '.join(AUDIO_OUT_FORMATS)}）")
 
 
 def extract_audio_keep(src: str, dst: str) -> str:
@@ -134,11 +151,52 @@ def extract_audio_keep(src: str, dst: str) -> str:
     输出格式由 dst 扩展名决定（见 AUDIO_OUT_FORMATS）。
     """
     ext = os.path.splitext(dst)[1].lower()
-    codec = AUDIO_OUT_FORMATS.get(ext)
-    if codec is None:
-        raise FFmpegError(f"不支持的音频输出格式: {ext}（支持: {', '.join(AUDIO_OUT_FORMATS)}）")
-    args = [FFMPEG, "-y", "-v", "error", "-i", src, "-vn", *codec[0], dst]
+    args = [FFMPEG, "-y", "-v", "error", "-i", src, "-vn", *_audio_codec_args(ext), dst]
     run(args)
+    return dst
+
+
+def convert_media(src: str, dst: str, bitrate: str | None = None,
+                  sr: int | None = None, denoise: float = 0.0) -> str:
+    """媒体格式转换（视频转音频 / 音频转音频）。
+
+    bitrate: 如 "192k"，None=编码器默认；sr: 目标采样率，None=保留源；
+    denoise: >0.01 时启用稳态谱减降噪（0~1 强度），经 wav 中间流程 DSP 处理，
+    降噪时保留源声道数（立体声逐声道处理）。
+    """
+    ext = os.path.splitext(dst)[1].lower()
+    codec = _audio_codec_args(ext)  # 非法格式直接抛错
+    if denoise and denoise > 0.01:
+        # 降噪需解码到波形做 DSP：提取 wav（保留声道）→ noisereduce → 再编码
+        import soundfile as sf
+        import noisereduce as nr
+        tmp_in = dst + ".in.wav"
+        tmp_den = dst + ".den.wav"
+        try:
+            wav_sr = sr or media_info(src).sample_rate or 44100
+            extract_audio(src, tmp_in, sr=wav_sr, mono=False)
+            y, rate = sf.read(tmp_in, dtype="float32")
+            if y.ndim == 1:
+                y = nr.reduce_noise(y=y, sr=rate, stationary=True, prop_decrease=denoise)
+            else:
+                # noisereduce 要求 (channels, samples)
+                y = nr.reduce_noise(y=y.T, sr=rate, stationary=True,
+                                    prop_decrease=denoise).T
+            sf.write(tmp_den, y.astype("float32"), rate)
+            args = [FFMPEG, "-y", "-v", "error", "-i", tmp_den, "-vn", *codec, dst]
+            run(args)
+        finally:
+            for t in (tmp_in, tmp_den):
+                try:
+                    os.remove(t)
+                except OSError:
+                    pass
+    else:
+        args = [FFMPEG, "-y", "-v", "error", "-i", src, "-vn", *codec]
+        if sr:
+            args += ["-ar", str(sr)]
+        args += [dst]
+        run(args)
     return dst
 
 

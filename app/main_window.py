@@ -1,7 +1,8 @@
 """ClearVoice 主界面（PySide6）。
 
 功能页签：消除杂音（多类型 DSP + 去背景音乐）/ 分割（定长/特征/关键词正则）/
-合并分离 / 时间轴（变速 / 音画同步微调 / 裁剪）/ 特征剔除 / 语音转文字 / 翻译 / TTS / 设置。
+合并分离 / 格式转换（批量视频转音频·音频转音频）/ 时间轴（变速 / 音画同步微调 / 裁剪）/
+特征剔除 / 语音转文字 / 翻译 / TTS / 设置。
 左栏：播放控制、波形选区、说话人与特征参考标记、进度与日志。
 """
 from __future__ import annotations
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QPushButton, QFileDialog, QComboBox,
     QCheckBox, QDoubleSpinBox, QTabWidget, QPlainTextEdit,
     QProgressBar, QMessageBox, QLineEdit, QGroupBox, QSizePolicy,
+    QListWidget,
 )
 
 from . import ffmpeg_tools as ft
@@ -561,7 +563,7 @@ class MainWindow(QMainWindow):
         v5 = QGridLayout(g5)
         v5.addWidget(QLabel("输出格式"), 0, 0)
         self.cmb_extract_fmt = QComboBox()
-        for _ext, (_args, _desc) in ft.AUDIO_OUT_FORMATS.items():
+        for _ext, _desc in ft.AUDIO_OUT_FORMATS.items():
             self.cmb_extract_fmt.addItem(f"{_desc}（*{_ext}）", _ext)
         v5.addWidget(self.cmb_extract_fmt, 0, 1)
         self.btn_extract = QPushButton("从当前文件分离音频")
@@ -569,6 +571,54 @@ class MainWindow(QMainWindow):
         f3.addWidget(g5)
         f3.addStretch(1)
         tabs.addTab(t3, "合并 / 分离")
+
+        # Tab 格式转换（批量：视频转音频 / 音频转音频）
+        tconv = QWidget()
+        fconv = QVBoxLayout(tconv)
+        gconv = QGroupBox("批量格式转换（视频转音频 / 音频转音频）")
+        vconv = QGridLayout(gconv)
+        self.lst_convert = QListWidget()
+        self.lst_convert.setMinimumHeight(120)
+        self.lst_convert.setSelectionMode(QListWidget.ExtendedSelection)
+        vconv.addWidget(self.lst_convert, 0, 0, 1, 3)
+        self.btn_conv_add = QPushButton("添加文件…")
+        self.btn_conv_del = QPushButton("移除所选")
+        self.btn_conv_clr = QPushButton("清空")
+        vconv.addWidget(self.btn_conv_add, 1, 0)
+        vconv.addWidget(self.btn_conv_del, 1, 1)
+        vconv.addWidget(self.btn_conv_clr, 1, 2)
+        vconv.addWidget(QLabel("输出格式"), 2, 0)
+        self.cmb_conv_fmt = QComboBox()
+        for _ext, _desc in ft.AUDIO_OUT_FORMATS.items():
+            self.cmb_conv_fmt.addItem(f"{_desc}（*{_ext}）", _ext)
+        vconv.addWidget(self.cmb_conv_fmt, 2, 1, 1, 2)
+        vconv.addWidget(QLabel("码率"), 3, 0)
+        self.cmb_conv_br = QComboBox()
+        self.cmb_conv_br.setEditable(True)
+        self.cmb_conv_br.addItems(["源 / 默认", "128k", "192k", "256k", "320k"])
+        vconv.addWidget(self.cmb_conv_br, 3, 1, 1, 2)
+        vconv.addWidget(QLabel("采样率"), 4, 0)
+        self.cmb_conv_sr = QComboBox()
+        self.cmb_conv_sr.addItems(["源", "8000", "16000", "22050", "32000", "44100", "48000"])
+        vconv.addWidget(self.cmb_conv_sr, 4, 1, 1, 2)
+        h_den = QHBoxLayout()
+        self.chk_conv_denoise = QCheckBox("启用降噪（强度）")
+        self.spin_conv_denoise = QDoubleSpinBox()
+        self.spin_conv_denoise.setRange(0.1, 1.0); self.spin_conv_denoise.setSingleStep(0.05)
+        self.spin_conv_denoise.setValue(0.85)
+        h_den.addWidget(self.chk_conv_denoise)
+        h_den.addWidget(self.spin_conv_denoise)
+        h_den.addStretch(1)
+        vconv.addLayout(h_den, 5, 0, 1, 3)
+        self.btn_convert = QPushButton("开始转换")
+        vconv.addWidget(self.btn_convert, 6, 0, 1, 3)
+        lbl_conv_tip = QLabel("输出到源文件同目录，文件名为 <源名>.<格式>（同名时自动加 _转换 后缀）；"
+                              "码率/采样率默认跟随源文件。")
+        lbl_conv_tip.setWordWrap(True)
+        vconv.addWidget(lbl_conv_tip, 7, 0, 1, 3)
+        fconv.addWidget(gconv)
+        fconv.addStretch(1)
+        tabs.addTab(tconv, "格式转换")
 
         # Tab4 时间轴
         t4 = QWidget()
@@ -811,6 +861,10 @@ class MainWindow(QMainWindow):
         self.btn_split_kw.clicked.connect(self.split_keyword)
         self.btn_merge_av.clicked.connect(self.merge_av)
         self.btn_extract.clicked.connect(self.extract_audio)
+        self.btn_conv_add.clicked.connect(self._conv_add_files)
+        self.btn_conv_del.clicked.connect(self._conv_del_selected)
+        self.btn_conv_clr.clicked.connect(self.lst_convert.clear)
+        self.btn_convert.clicked.connect(self.convert_media_batch)
         self.btn_speed.clicked.connect(self.change_speed)
         self.btn_av_preview.clicked.connect(self.preview_av_sync)
         self.btn_av_restore.clicked.connect(self.restore_av_preview)
@@ -1312,6 +1366,56 @@ class MainWindow(QMainWindow):
         self._run("分离音频",
                   lambda src, o, progress_cb=None: ft.extract_audio_keep(src, o),
                   self.src, out)
+
+    # ---------------------------------------------------------------- 格式转换
+    def _conv_add_files(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "选择媒体文件", "", "媒体文件 (*)")
+        existing = {self.lst_convert.item(i).text() for i in range(self.lst_convert.count())}
+        for f in files:
+            f = os.path.abspath(f)
+            if f not in existing:
+                self.lst_convert.addItem(f)
+
+    def _conv_del_selected(self):
+        for item in self.lst_convert.selectedItems():
+            self.lst_convert.takeItem(self.lst_convert.row(item))
+
+    def convert_media_batch(self):
+        files = [self.lst_convert.item(i).text() for i in range(self.lst_convert.count())]
+        if not files:
+            QMessageBox.information(self, "提示", "请先添加要转换的媒体文件")
+            return
+        missing = [f for f in files if not os.path.isfile(f)]
+        if missing:
+            QMessageBox.warning(self, "提示", "以下文件不存在：\n" + "\n".join(missing[:5]))
+            return
+        fmt = self.cmb_conv_fmt.currentData() or ".mp3"
+        br_txt = self.cmb_conv_br.currentText().strip()
+        bitrate = None if br_txt in ("", "源", "源 / 默认", "源/默认") else br_txt
+        sr_txt = self.cmb_conv_sr.currentText().strip()
+        try:
+            sr = None if sr_txt in ("源", "") else int(sr_txt)
+        except ValueError:
+            sr = None
+        denoise = float(self.spin_conv_denoise.value()) if self.chk_conv_denoise.isChecked() else 0.0
+        self._run("格式转换", self._job_convert, files, fmt, bitrate, sr, denoise)
+
+    @staticmethod
+    def _job_convert(files, fmt, bitrate, sr, denoise, progress_cb=None):
+        outs = []
+        n = len(files)
+        for i, src in enumerate(files):
+            base, _ = os.path.splitext(src)
+            dst = base + fmt
+            if os.path.abspath(dst) == os.path.abspath(src):
+                dst = base + "_转换" + fmt  # 同格式转码避免覆盖源文件
+            progress_cb(int(95 * i / n), f"转换 {i + 1}/{n}: {os.path.basename(src)}")
+            ft.convert_media(src, dst, bitrate=bitrate, sr=sr, denoise=denoise)
+            outs.append(dst)
+        progress_cb(100, "转换完成")
+        return {"output": outs[0],
+                "report": f"共转换 {n} 个文件（格式 {fmt}，码率 {bitrate or '默认'}，"
+                          f"采样率 {sr or '源'}，降噪 {denoise:g}）:\n" + "\n".join(outs)}
 
     # ---------------------------------------------------------------- 时间轴
     def change_speed(self):

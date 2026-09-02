@@ -74,6 +74,17 @@ try:
     raise SystemExit("不支持的格式应报错")
 except Exception:
     pass
+# 格式转换：指定码率/采样率 + 降噪路径（音频转音频）
+_d = os.path.dirname(__file__)
+conv_mp3 = os.path.join(_d, "_conv.mp3")
+ft.convert_media(out_mute, conv_mp3, bitrate="128k", sr=22050)
+ci = ft.media_info(conv_mp3)
+assert ci.sample_rate == 22050 and ci.channels == 1, f"转换采样率/声道不符: {ci.sample_rate}/{ci.channels}"
+conv_den = os.path.join(_d, "_conv_den.wav")
+ft.convert_media(out_mute, conv_den, denoise=0.5)
+assert ft.media_info(conv_den).duration > 0
+for _p in (conv_mp3, conv_den):
+    os.remove(_p)
 print(f"ok ({info.duration:.2f}s)")
 
 print("8) ASR 导出格式（TXT/SRT/LRC）...", end=" ", flush=True)
