@@ -253,6 +253,59 @@ def change_speed(src: str, out: str, speed: float) -> str:
     return out
 
 
+def _sync_audio_args(offset: float) -> list[str]:
+    """按音频偏移方向生成滤镜参数（供音画同步微调）。
+
+    offset > 0：音频延后（推迟播放）→ adelay 补静音；
+    offset < 0：音频提前 → atrim 掐掉开头 |offset| 秒（等价于整体前移）。
+    """
+    if offset > 0:
+        ms = int(round(offset * 1000))
+        return ["-af", f"adelay={ms}:all=1"]
+    if offset < 0:
+        return ["-af", f"atrim=start={abs(offset):.3f},asetpts=PTS-STARTPTS"]
+    return []
+
+
+def av_sync_offset(src: str, out: str, offset: float) -> str:
+    """音画同步微调：把音频相对画面提前/推迟 |offset| 秒，生成新文件。
+
+    视频流直接 copy，音频重编码 aac；offset=0 视为无操作报错。仅对含视频的文件有意义。
+    """
+    if abs(offset) < 0.001:
+        raise FFmpegError("偏移量为 0，无需处理")
+    args = [FFMPEG, "-y", "-v", "error", "-i", src, *_sync_audio_args(offset),
+            "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", "-c:a", "aac",
+            "-b:a", "192k"]
+    if offset > 0:
+        # 音频延后补了静音，用 -shortest 掐掉尾部多余时长；负偏移时音频变短，
+        # 不能用 -shortest（会截掉视频尾部），让其自然以静音结尾。
+        args += ["-shortest"]
+    args += [out]
+    run(args)
+    return out
+
+
+def av_sync_preview(src: str, out: str, offset: float, start: float, dur: float = 20.0) -> str:
+    """生成音画同步校准预览片段（默认从 start 起 20 秒），视频音频都重编码保证对齐准确。
+
+    用于快速试听偏移效果：播放该片段即可判断同步是否合适。
+    """
+    if abs(offset) < 0.001:
+        raise FFmpegError("偏移量为 0，无需预览")
+    args = [FFMPEG, "-y", "-v", "error",
+            "-ss", f"{max(0.0, start):.3f}", "-i", src, "-t", f"{dur:.3f}",
+            *_sync_audio_args(offset),
+            "-map", "0:v:0", "-map", "0:a:0?",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+            "-c:a", "aac", "-b:a", "160k"]
+    if offset > 0:
+        args += ["-shortest"]
+    args += [out]
+    run(args)
+    return out
+
+
 def encode_wav_to_media(wav: str, out: str, has_video_in_out: bool = False) -> str:
     """处理后的 wav 写回音频文件（mp3/m4a/wav 按扩展名）。"""
     args = [FFMPEG, "-y", "-v", "error", "-i", wav]

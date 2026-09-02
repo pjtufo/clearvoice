@@ -1,13 +1,14 @@
 """ClearVoice 主界面（PySide6）。
 
 功能页签：消除杂音（多类型 DSP + 去背景音乐）/ 分割（定长/特征/关键词正则）/
-合并分离 / 时间轴（变速裁剪）/ 特征剔除 / 语音转文字 / 翻译 / TTS / 设置。
+合并分离 / 时间轴（变速 / 音画同步微调 / 裁剪）/ 特征剔除 / 语音转文字 / 翻译 / TTS / 设置。
 左栏：播放控制、波形选区、说话人与特征参考标记、进度与日志。
 """
 from __future__ import annotations
 
 import os
 import re
+import tempfile
 import traceback
 
 import numpy as np
@@ -384,6 +385,23 @@ class MainWindow(QMainWindow):
         self.btn_speed = QPushButton("应用变速")
         v6.addWidget(self.btn_speed, 0, 2)
         f4.addWidget(g6)
+        g7b = QGroupBox("音画同步微调（视频音频不同步时，把音频提前/推迟）")
+        v7b = QGridLayout(g7b)
+        v7b.addWidget(QLabel("音频偏移"), 0, 0)
+        self.spin_av_sync = QDoubleSpinBox(); self.spin_av_sync.setRange(-10.0, 10.0)
+        self.spin_av_sync.setSingleStep(0.05); self.spin_av_sync.setValue(0.0)
+        self.spin_av_sync.setSuffix(" 秒"); self.spin_av_sync.setMinimumWidth(100)
+        v7b.addWidget(self.spin_av_sync, 0, 1)
+        lbl_sync_tip = QLabel("正值 = 音频延后（推迟播放）· 负值 = 音频提前")
+        lbl_sync_tip.setWordWrap(True)
+        v7b.addWidget(lbl_sync_tip, 0, 2)
+        self.btn_av_preview = QPushButton("试听预览（当前位置起 20 秒）")
+        v7b.addWidget(self.btn_av_preview, 1, 0)
+        self.btn_av_restore = QPushButton("恢复播放原文件")
+        v7b.addWidget(self.btn_av_restore, 1, 1)
+        self.btn_av_apply = QPushButton("应用到文件（生成新文件）")
+        v7b.addWidget(self.btn_av_apply, 1, 2)
+        f4.addWidget(g7b)
         g7 = QGroupBox("裁剪")
         v7 = QVBoxLayout(g7)
         self.btn_trim = QPushButton("裁剪为所选区间")
@@ -596,6 +614,9 @@ class MainWindow(QMainWindow):
         self.btn_merge_av.clicked.connect(self.merge_av)
         self.btn_extract.clicked.connect(self.extract_audio)
         self.btn_speed.clicked.connect(self.change_speed)
+        self.btn_av_preview.clicked.connect(self.preview_av_sync)
+        self.btn_av_restore.clicked.connect(self.restore_av_preview)
+        self.btn_av_apply.clicked.connect(self.apply_av_sync)
         self.btn_trim.clicked.connect(self.trim_selection)
         self.btn_text_remove.clicked.connect(self.remove_text_feature)
         self.btn_sim_remove.clicked.connect(self.remove_similar_feature)
@@ -1085,6 +1106,54 @@ class MainWindow(QMainWindow):
         out = self.out_path(f"_x{sp:g}")
         self._run("变速", lambda src, o, s, progress_cb=None: ft.change_speed(src, o, s),
                   self.src, out, sp)
+
+    def _require_video(self) -> bool:
+        if not self._require_src():
+            return False
+        if not (self.info and self.info.has_video):
+            QMessageBox.information(self, "提示", "音画同步微调仅对视频文件有效（当前打开的是纯音频）")
+            return False
+        return True
+
+    def preview_av_sync(self):
+        """生成带音频偏移的 20 秒校准片段并自动播放，供试听同步效果。"""
+        if not self._require_video():
+            return
+        off = float(self.spin_av_sync.value())
+        if abs(off) < 0.001:
+            QMessageBox.information(self, "提示", "请先设置音频偏移量（非 0）")
+            return
+        start = self.player.position() / 1000.0
+        out = os.path.join(tempfile.gettempdir(), "clearvoice_sync_preview.mp4")
+        self._run("同步预览",
+                  lambda src, o, f, s, progress_cb=None: ft.av_sync_preview(src, o, f, s),
+                  self.src, out, off, start,
+                  on_done=lambda _res: self._play_preview(out, off))
+
+    def _play_preview(self, path: str, off: float):
+        self.player.setSource(QUrl.fromLocalFile(path))
+        self.player.play()
+        self.btn_play.setText("暂停")
+        self.log_append(f"[同步预览] 正在播放校准片段（音频偏移 {off:+g} 秒）：{path}")
+
+    def restore_av_preview(self):
+        if not self._require_src():
+            return
+        self.player.setSource(QUrl.fromLocalFile(self.src))
+        self.log_append("[同步预览] 已恢复播放原文件")
+
+    def apply_av_sync(self):
+        """按当前偏移量生成新文件：视频流 copy，音频提前/推迟。"""
+        if not self._require_video():
+            return
+        off = float(self.spin_av_sync.value())
+        if abs(off) < 0.001:
+            QMessageBox.information(self, "提示", "偏移量为 0，无需处理")
+            return
+        out = self.out_path(f"_同步{off:+g}s")
+        self._run("音画同步",
+                  lambda src, o, f, progress_cb=None: ft.av_sync_offset(src, o, f),
+                  self.src, out, off)
 
     def trim_selection(self):
         if not self._require_src():

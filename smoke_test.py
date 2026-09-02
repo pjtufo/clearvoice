@@ -58,6 +58,15 @@ ffmpeg_tools_mute = __import__("app.ffmpeg_tools", fromlist=["mute_ranges"]).mut
 info = ffmpeg_tools_mute and None
 from app import ffmpeg_tools as ft
 info = ft.media_info(out_mute)
+# 音画同步滤镜参数断言（纯逻辑，离线）
+assert ft._sync_audio_args(0.3) == ["-af", "adelay=300:all=1"]
+assert ft._sync_audio_args(-0.25) == ["-af", "atrim=start=0.250,asetpts=PTS-STARTPTS"]
+assert ft._sync_audio_args(0.0) == []
+try:
+    ft.av_sync_offset(out_mute, os.path.join(os.path.dirname(__file__), "_x.mp4"), 0.0)
+    raise SystemExit("偏移 0 应报错")
+except Exception:
+    pass
 print(f"ok ({info.duration:.2f}s)")
 
 print("8) ASR 导出格式（TXT/SRT/LRC）...", end=" ", flush=True)
