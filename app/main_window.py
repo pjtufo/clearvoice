@@ -202,6 +202,7 @@ class MainWindow(QMainWindow):
         self.player.setAudioOutput(self.audio_out)
 
         self._build_ui()
+        self.player.setVideoOutput(self.video)  # 绑定视频画面输出（缺失会导致有声音无图像）
         self._load_settings()
         self._connect()
 
@@ -228,13 +229,11 @@ class MainWindow(QMainWindow):
         self.rate = QComboBox()
         self.rate.addItems(["0.25x", "0.5x", "0.75x", "1x", "1.25x", "1.5x", "2x", "3x", "4x"])
         self.rate.setCurrentText("1x")
-        self.btn_slow = QPushButton("慢速 0.5x")
-        self.btn_slow.setCheckable(True)
         self.btn_mark_in = QPushButton("标记开始")
         self.btn_mark_out = QPushButton("标记结束")
         self.btn_sel_clear = QPushButton("清除选择")
         self.lbl_sel = QLabel("未选择区间")
-        for w in (self.btn_open, self.btn_play, self.btn_stop, self.rate, self.btn_slow,
+        for w in (self.btn_open, self.btn_play, self.btn_stop, self.rate,
                   self.btn_mark_in, self.btn_mark_out, self.btn_sel_clear, self.lbl_sel):
             ctl.addWidget(w)
         ctl.addStretch(1)
@@ -574,7 +573,6 @@ class MainWindow(QMainWindow):
         self.btn_play.clicked.connect(self.toggle_play)
         self.btn_stop.clicked.connect(self.player.stop)
         self.rate.currentTextChanged.connect(self._set_rate)
-        self.btn_slow.toggled.connect(self._slow_toggle)
         self.btn_mark_in.clicked.connect(lambda: self._mark("in"))
         self.btn_mark_out.clicked.connect(lambda: self._mark("out"))
         self.btn_sel_clear.clicked.connect(self._clear_sel)
@@ -755,14 +753,6 @@ class MainWindow(QMainWindow):
     def _set_rate(self, text: str):
         r = float(text.rstrip("x"))
         self.player.setPlaybackRate(r)
-        self.btn_slow.setChecked(r < 1.0)
-
-    def _slow_toggle(self, on: bool):
-        if on:
-            self._prev_rate = self.rate.currentText()
-            self.rate.setCurrentText("0.5x")
-        else:
-            self.rate.setCurrentText(getattr(self, "_prev_rate", "1x"))
 
     def _seek(self, t: float):
         self.player.setPosition(int(t * 1000))
