@@ -191,6 +191,24 @@ wv.set_playhead(2.9, playing=True)
 assert wv.view[0] <= 2.9 <= wv.view[1], "播放头跟随失败"
 assert wv._nice_step(0.35) == 0.5 and wv._nice_step(75.0) == 120, "刻度步进取整错误"
 assert wv._fmt_ruler(65.0, 1) == "01:05" and wv._fmt_ruler(1.25, 0.1) == "00:01.2"
+# 底部概览条：命中测试 / 拖拽平移缩放 / 框选 / 双击复位
+wv.reset_view()
+ov_top = wv._ov_top()
+assert wv._ov_hit(0, ov_top + 10) == "left" and wv._ov_hit(wv.width(), ov_top + 10) == "right"
+assert wv._ov_hit(wv.width() // 2, ov_top + 10) == "pan"
+assert wv._ov_hit(wv.width() // 2, ov_top - 20) == ""
+wv._set_view(1.0, 2.0)
+assert wv._ov_hit(100, ov_top + 10) == "outside"
+wv._set_view(wv._ov_x2t(300), wv.view[1])  # 拖左边缘
+assert wv.view[1] == 2.0 and abs(wv.view[0] - 0.9) < 0.02
+wv._set_view(-5.0, 99.0)                   # 越界钳制为全览
+assert wv.view[0] == 0.0 and abs(wv.view[1] - 3.0) < 1e-6
+wv._set_view(1.0, 1.005)                   # 小于最小窗口
+assert wv.view[1] - wv.view[0] >= wv._min_window() - 1e-9
+wv.reset_view()
+assert abs(wv.view[0]) < 1e-9 and abs(wv.view[1] - 3.0) < 1e-6
+wv._set_view(wv._ov_x2t(200), wv._ov_x2t(800))  # 框选放大
+assert abs(wv.view[0] - 0.6) < 0.01 and abs(wv.view[1] - 2.4) < 0.01
 # fps 解析
 from app.ffmpeg_tools import _parse_fps
 assert abs(_parse_fps("30000/1001") - 29.97) < 0.01 and _parse_fps("0/0") == 0.0

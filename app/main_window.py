@@ -64,18 +64,21 @@ class WaveformWidget(QWidget):
     """音频波形：时间刻度尺 + 立体声 L/R 双行 + 视图缩放。
 
     交互：点击定位 / 拖拽选区 / 滚轮水平滚动 / Ctrl+滚轮以光标为中心缩放；
-    播放中播放头越出视图自动跟随滚动。短文件（≤10 分钟）保留原始采样，
-    可缩放到单采样级；长文件缩放受概览包络分辨率限制。
+    底部概览条可鼠标拖拽——拖窗口内部平移、拖左右边缘缩放、窗口外框选放大、
+    双击复位全览；播放中播放头越出视图自动跟随滚动。短文件（≤10 分钟）保留
+    原始采样，可缩放到单采样级；长文件缩放受概览包络分辨率限制。
     """
     clicked = Signal(float)          # 秒
     selection_drawn = Signal(float, float)  # 起止秒（拖拽选择）
 
     _RULER_H = 18
+    _OV_H = 42          # 底部概览条高度
+    _EDGE = 6           # 视图窗口边缘抓取宽度（像素）
     _STEPS = (0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1200, 1800, 3600)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumHeight(150)
+        self.setMinimumHeight(190)
         self.duration = 0.0
         self.playhead = 0.0
         self.sel: tuple[float, float] | None = None
@@ -90,7 +93,13 @@ class WaveformWidget(QWidget):
         self.view_env: list[np.ndarray] = []  # 当前视图包络（用于绘制）
         self._raw: np.ndarray | None = None   # 短文件保留原始采样（供深度缩放）
         self._raw_sr = 16000
-        self.setMouseTracking(False)
+        # 概览条拖拽状态：pan=拖窗口 / left,right=拖边缘 / select=窗口外框选
+        self._ov_mode: str | None = None
+        self._ov_start_t = 0.0
+        self._ov_press_x = 0
+        self._ov_sel_x: int | None = None
+        self._ov_pan_anchor: tuple[float, float, float] | None = None  # (按下时t, view0, view1)
+        self.setMouseTracking(True)
 
     # ---------- 数据 ----------
     def set_data(self, y: np.ndarray, sr: int, duration: float):
@@ -192,6 +201,51 @@ class WaveformWidget(QWidget):
         self._rebuild_view_env()
         self.update()
 
+    def _set_view(self, t0: float, t1: float):
+        """设置视图窗口（秒），自动钳制到 [0, duration] 与最小窗口。"""
+        if self.duration <= 0:
+            return
+        t0, t1 = min(t0, t1), max(t0, t1)
+        span = min(max(t1 - t0, self._min_window()), self.duration)
+        t0 = min(max(0.0, t0), max(0.0, self.duration - span))
+        self.view = [t0, t0 + span]
+        self._rebuild_view_env()
+        self.update()
+
+    def reset_view(self):
+        """视图复位为全览。"""
+        if self.duration > 0:
+            self._set_view(0.0, self.duration)
+
+    # ---------- 概览条 ----------
+    def _ov_top(self) -> int:
+        h = self.height()
+        ruler_h = self._RULER_H if self.duration > 0 else 0
+        return h - ruler_h - (self._OV_H if self.duration > 0 else 0)
+
+    def _ov_x2t(self, x: float) -> float:
+        if self.width() <= 0 or self.duration <= 0:
+            return 0.0
+        return min(max(0.0, x / self.width()), 1.0) * self.duration
+
+    def _ov_t2x(self, t: float) -> float:
+        if self.duration <= 0:
+            return 0.0
+        return t / self.duration * self.width()
+
+    def _ov_hit(self, x: float, y: float) -> str:
+        """概览条命中测试：pan=窗口内 / left,right=边缘手柄 / outside=窗口外 / ''=不在概览条。"""
+        if self.duration <= 0 or y < self._ov_top():
+            return ""
+        wx0, wx1 = self._ov_t2x(self.view[0]), self._ov_t2x(self.view[1])
+        if abs(x - wx0) <= self._EDGE:
+            return "left"
+        if abs(x - wx1) <= self._EDGE:
+            return "right"
+        if wx0 < x < wx1:
+            return "pan"
+        return "outside"
+
     def set_playhead(self, t: float, playing: bool = False):
         """更新播放头；播放中若越出视图自动跟随滚动。"""
         self.playhead = t
@@ -224,7 +278,9 @@ class WaveformWidget(QWidget):
         p.fillRect(self.rect(), QColor(18, 18, 22))
         w, h = self.width(), self.height()
         ruler_h = self._RULER_H if self.duration > 0 else 0
-        wh = h - ruler_h
+        ov_h = self._OV_H if self.duration > 0 else 0
+        wh = h - ruler_h - ov_h          # 波形区高度
+        ov_top = wh + ruler_h            # 概览条顶部 y
 
         def shade(a, b, color):
             if a is None or b is None or self.duration <= 0:
@@ -289,8 +345,50 @@ class WaveformWidget(QWidget):
             while t <= self.view[1] + 1e-9:
                 x = int(self._t2x(t))
                 p.drawLine(x, wh, x, wh + 5)
-                p.drawText(x + 3, h - 5, self._fmt_ruler(t, step))
+                p.drawText(x + 3, wh + ruler_h - 5, self._fmt_ruler(t, step))
                 t += step
+
+        # 概览条（全长缩略 + 可拖拽视图窗口）
+        if ov_h:
+            p.fillRect(0, ov_top, w, ov_h, QColor(10, 10, 14))
+            # 全长包络（每像素 min/max）
+            if self.env_ch:
+                env = self.env_ch[0]
+                n = len(env)
+                mid = ov_top + ov_h / 2
+                amp = ov_h * 0.40
+                p.setPen(QPen(QColor(70, 130, 170), 1))
+                for x in range(w):
+                    j = int(x / w * n)
+                    if 0 <= j < n:
+                        lo, hi = env[j]
+                        p.drawLine(x, int(mid + lo * amp), x, int(mid + hi * amp))
+            wx0, wx1 = self._ov_t2x(self.view[0]), self._ov_t2x(self.view[1])
+            # 窗口外压暗
+            p.fillRect(0, ov_top, int(max(0, wx0)), ov_h, QColor(0, 0, 0, 120))
+            p.fillRect(int(min(w, wx1)), ov_top, int(max(0, w - wx1)), ov_h, QColor(0, 0, 0, 120))
+            # 窗口边框与边缘手柄
+            p.setPen(QPen(QColor(255, 200, 60), 1))
+            p.drawRect(int(wx0), ov_top + 1, int(max(2, wx1 - wx0)), ov_h - 2)
+            p.setPen(QPen(QColor(255, 220, 120), 3))
+            for hx in (wx0, wx1):
+                p.drawLine(int(hx), ov_top + 3, int(hx), ov_top + ov_h - 3)
+            # 框选预览（窗口外拖拽中）
+            if self._ov_mode == "select" and getattr(self, "_ov_sel_x", None) is not None:
+                sx0, sx1 = sorted((self._ov_sel_x, self._ov_press_x))
+                p.fillRect(int(sx0), ov_top, int(max(2, sx1 - sx0)), ov_h, QColor(255, 200, 60, 60))
+                p.setPen(QPen(QColor(255, 200, 60), 1))
+                p.drawRect(int(sx0), ov_top + 1, int(max(2, sx1 - sx0)), ov_h - 2)
+            # 概览条上的播放头
+            p.setPen(QPen(QColor(255, 70, 70), 1))
+            ox = self._ov_t2x(self.playhead)
+            p.drawLine(int(ox), ov_top, int(ox), ov_top + ov_h)
+            # 分隔线与提示
+            p.setPen(QPen(QColor(70, 70, 82), 1))
+            p.drawLine(0, ov_top, w, ov_top)
+            if self.view[1] - self.view[0] >= self.duration - 1e-6:
+                p.setPen(QColor(110, 110, 120))
+                p.drawText(6, ov_top + 13, "概览（全览）：拖窗口移动 · 拖边缘缩放 · 窗口外框选放大 · 双击复位")
 
         # 左上角信息（播放头时间 + 缩放状态）
         p.setPen(QColor(150, 150, 150))
@@ -325,16 +423,70 @@ class WaveformWidget(QWidget):
 
     # ---------- 鼠标 / 滚轮 ----------
     def mousePressEvent(self, ev):  # noqa: N802
-        if ev.button() == Qt.LeftButton:
-            self._press_x = ev.position().x()
-            self._drag_x = int(self._press_x)
+        if ev.button() != Qt.LeftButton:
+            return
+        x, y = ev.position().x(), ev.position().y()
+        hit = self._ov_hit(x, y)
+        if hit:
+            # 概览条操作（与波形区点击/选区互斥）
+            self._ov_mode = hit
+            self._ov_press_x = int(x)
+            self._ov_sel_x = int(x) if hit == "outside" else None
+            self._ov_start_t = self._ov_x2t(x)
+            if hit == "pan":
+                self._ov_pan_anchor = (self._ov_x2t(x), self.view[0], self.view[1])
+            self.setCursor(Qt.ClosedHandCursor)
+            return
+        self._press_x = x
+        self._drag_x = int(x)
 
     def mouseMoveEvent(self, ev):  # noqa: N802
+        x, y = ev.position().x(), ev.position().y()
+        # 概览条拖拽中
+        if self._ov_mode:
+            t = self._ov_x2t(x)
+            if self._ov_mode == "pan" and self._ov_pan_anchor:
+                t0_anchor, v0, v1 = self._ov_pan_anchor
+                self._set_view(v0 + (t - t0_anchor), v1 + (t - t0_anchor))
+            elif self._ov_mode == "left":
+                self._set_view(t, self.view[1])
+            elif self._ov_mode == "right":
+                self._set_view(self.view[0], t)
+            elif self._ov_mode == "outside":
+                self._ov_sel_x = int(x)
+                self.update()
+            return
+        # 波形区拖拽（选区）
         if self._press_x is not None:
-            self._drag_x = int(ev.position().x())
+            self._drag_x = int(x)
             self.update()
+            return
+        # 无按键：按 hover 位置切换光标
+        hit = self._ov_hit(x, y)
+        if hit in ("left", "right"):
+            self.setCursor(Qt.SplitHCursor)
+        elif hit == "pan":
+            self.setCursor(Qt.OpenHandCursor)
+        elif hit == "outside":
+            self.setCursor(Qt.CrossCursor)
+        else:
+            self.unsetCursor()
 
     def mouseReleaseEvent(self, ev):  # noqa: N802
+        # 概览条释放
+        if self._ov_mode:
+            if self._ov_mode == "outside":
+                a = self._ov_x2t(min(self._ov_press_x, ev.position().x()))
+                b = self._ov_x2t(max(self._ov_press_x, ev.position().x()))
+                min_sel = max(self._min_window(), self.duration / max(1, self.width()) * 4)
+                if b - a >= min_sel:
+                    self._set_view(a, b)
+            self._ov_mode = None
+            self._ov_sel_x = None
+            self._ov_pan_anchor = None
+            self.unsetCursor()
+            self.update()
+            return
         if self._press_x is None:
             return
         x = ev.position().x()
@@ -348,6 +500,11 @@ class WaveformWidget(QWidget):
         self._press_x = None
         self._drag_x = None
         self.update()
+
+    def mouseDoubleClickEvent(self, ev):  # noqa: N802
+        if ev.button() == Qt.LeftButton and \
+                self._ov_hit(ev.position().x(), ev.position().y()):
+            self.reset_view()  # 双击概览条复位全览
 
     def wheelEvent(self, ev):  # noqa: N802
         if self.duration <= 0:
@@ -408,7 +565,7 @@ class MainWindow(QMainWindow):
         left.addWidget(self.video, 6)
 
         self.wave = WaveformWidget()
-        self.wave.setMinimumHeight(170)  # 立体声双行 + 时间刻度尺需要更高
+        self.wave.setMinimumHeight(210)  # 立体声双行 + 时间刻度尺 + 概览条
         left.addWidget(self.wave, 2)
 
         ctl = QHBoxLayout()
