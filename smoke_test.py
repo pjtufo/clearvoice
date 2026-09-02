@@ -154,6 +154,28 @@ from PySide6.QtWidgets import QApplication
 app = QApplication([])
 w = main_window.MainWindow()
 w.show()
+# 波形新特性：立体声双行 / 缩放 / 时间刻度（纯逻辑断言）
+wv = w.wave
+y_st = np.zeros((16000 * 3, 2), dtype=np.float32)
+y_st[:, 0] = 0.5 * np.sin(np.linspace(0, 200 * np.pi, 16000 * 3))
+y_st[:, 1] = -0.3 * np.sin(np.linspace(0, 90 * np.pi, 16000 * 3))
+wv.resize(1000, 160)
+wv.set_data(y_st, 16000, 3.0)
+assert wv.stereo and len(wv.view_env) == 2, "立体声应为两行包络"
+assert len(wv.env_ch[0]) >= 8000, "概览包络分辨率不足"
+wv._zoom_at(8.0, center_t=1.0)
+t0, t1 = wv.view
+assert t1 - t0 <= 3.0 / 8 + 1e-6, "缩放后视图窗口应缩小"
+assert abs(wv._t2x(t0)) < 1e-6 and abs(wv._t2x(t1) - wv.width()) < 1e-6, "视图端点映射错误"
+wv._scroll_by(0.5)
+assert wv.view[0] >= 0.0, "滚动越界"
+wv.set_playhead(2.9, playing=True)
+assert wv.view[0] <= 2.9 <= wv.view[1], "播放头跟随失败"
+assert wv._nice_step(0.35) == 0.5 and wv._nice_step(75.0) == 120, "刻度步进取整错误"
+assert wv._fmt_ruler(65.0, 1) == "01:05" and wv._fmt_ruler(1.25, 0.1) == "00:01.2"
+# fps 解析
+from app.ffmpeg_tools import _parse_fps
+assert abs(_parse_fps("30000/1001") - 29.97) < 0.01 and _parse_fps("0/0") == 0.0
 print("ok")
 
 os.remove(test_wav)

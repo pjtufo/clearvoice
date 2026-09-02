@@ -6,13 +6,14 @@
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 import tempfile
 import traceback
 
 import numpy as np
-from PySide6.QtCore import Qt, QThread, QUrl, Signal
+from PySide6.QtCore import Qt, QThread, QUrl, Signal, QPointF
 from PySide6.QtGui import QPainter, QColor, QPen
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -58,13 +59,21 @@ class Worker(QThread):
 # ================================================================ 波形控件
 
 class WaveformWidget(QWidget):
+    """音频波形：时间刻度尺 + 立体声 L/R 双行 + 视图缩放。
+
+    交互：点击定位 / 拖拽选区 / 滚轮水平滚动 / Ctrl+滚轮以光标为中心缩放；
+    播放中播放头越出视图自动跟随滚动。短文件（≤10 分钟）保留原始采样，
+    可缩放到单采样级；长文件缩放受概览包络分辨率限制。
+    """
     clicked = Signal(float)          # 秒
     selection_drawn = Signal(float, float)  # 起止秒（拖拽选择）
 
+    _RULER_H = 18
+    _STEPS = (0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1200, 1800, 3600)
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumHeight(110)
-        self.envelope: np.ndarray | None = None   # (N,2) min/max
+        self.setMinimumHeight(150)
         self.duration = 0.0
         self.playhead = 0.0
         self.sel: tuple[float, float] | None = None
@@ -72,79 +81,221 @@ class WaveformWidget(QWidget):
         self.feature_ref: tuple[float, float] | None = None
         self._press_x: int | None = None
         self._drag_x: int | None = None
+        # 缩放视图（秒区间）
+        self.view = [0.0, 0.0]
+        self.stereo = False
+        self.env_ch: list[np.ndarray] = []    # 整段概览包络（每声道 (n,2) min/max）
+        self.view_env: list[np.ndarray] = []  # 当前视图包络（用于绘制）
+        self._raw: np.ndarray | None = None   # 短文件保留原始采样（供深度缩放）
+        self._raw_sr = 16000
         self.setMouseTracking(False)
 
     # ---------- 数据 ----------
     def set_data(self, y: np.ndarray, sr: int, duration: float):
-        self.duration = duration
-        n = max(600, self.width())
-        if len(y) == 0:
-            self.envelope = None
-        else:
-            m = len(y) // n
-            if m < 1:
-                m = 1
-            trim = (len(y) // m) * m
-            yy = y[:trim].reshape(-1, m)
-            self.envelope = np.stack([yy.min(axis=1), yy.max(axis=1)], axis=1)
+        self.duration = float(duration)
+        self._raw_sr = sr
+        self.stereo = getattr(y, "ndim", 1) > 1 and y.shape[1] > 1
+        # 短文件（≤10 分钟）保留原始采样，支持缩放到采样级
+        self._raw = y.astype(np.float32) if (0 < duration <= 600 and len(y)) else None
+        chans = [y] if y.ndim == 1 else [y[:, 0], y[:, 1]]
+        n = int(np.clip(max(8000, self.width() * 4), 8000, 120000))
+        envs: list[np.ndarray] = []
+        if len(y):
+            for c in chans:
+                m = max(1, len(c) // n)
+                trim = (len(c) // m) * m
+                yy = c[:trim].reshape(-1, m)
+                envs.append(np.stack([yy.min(axis=1), yy.max(axis=1)], axis=1))
+        self.env_ch = envs
+        self.view = [0.0, self.duration] if self.duration > 0 else [0.0, 0.0]
+        self._rebuild_view_env()
         self.update()
 
     def clear_all(self):
-        self.envelope = None
         self.duration = 0.0
         self.playhead = 0.0
         self.sel = None
         self.speaker_ref = None
         self.feature_ref = None
+        self.view = [0.0, 0.0]
+        self.stereo = False
+        self.env_ch = []
+        self.view_env = []
+        self._raw = None
         self.update()
 
+    def _rebuild_view_env(self):
+        """按当前视图窗口重算绘制包络（有原始采样时精确到采样级）。"""
+        if self.duration <= 0 or not self.env_ch:
+            self.view_env = []
+            return
+        t0, t1 = self.view
+        if self._raw is not None:
+            sr = self._raw_sr
+            i0 = int(t0 * sr)
+            i1 = max(i0 + 1, int(t1 * sr))
+            raw = self._raw
+            chans = [raw] if raw.ndim == 1 else [raw[:, 0], raw[:, 1]]
+            bins = int(np.clip(self.width() * 2, 500, 20000))
+            envs = []
+            for c in chans:
+                seg = c[i0:i1]
+                b = max(1, len(seg) // bins)
+                trim = (len(seg) // b) * b
+                if trim <= 0:
+                    envs.append(np.array([[0.0, 0.0]], dtype=np.float32))
+                    continue
+                yy = seg[:trim].reshape(-1, b)
+                envs.append(np.stack([yy.min(axis=1), yy.max(axis=1)], axis=1))
+            self.view_env = envs
+        else:
+            envs = []
+            for e in self.env_ch:
+                nn = len(e)
+                j0 = int(t0 / self.duration * nn)
+                j1 = max(j0 + 1, int(t1 / self.duration * nn))
+                envs.append(e[j0:j1])
+            self.view_env = envs
+
+    def _min_window(self) -> float:
+        """缩放下限（秒）：有原始采样可放到 0.02s，否则受概览包络分辨率限制。"""
+        if self.duration <= 0:
+            return 0.02
+        if self._raw is not None:
+            return 0.02
+        n = len(self.env_ch[0]) if self.env_ch else 8000
+        return max(0.02, self.duration * max(300, self.width()) / n)
+
+    def _zoom_at(self, factor: float, center_t: float | None = None):
+        """以 center_t（默认视图中心）为锚缩放视图，factor>1 放大。"""
+        if self.duration <= 0:
+            return
+        t0, t1 = self.view
+        if center_t is None:
+            center_t = (t0 + t1) / 2
+        half = min(max((t1 - t0) / 2 / factor, self._min_window() / 2), self.duration / 2)
+        c = min(max(center_t, half), self.duration - half)
+        self.view = [c - half, c + half]
+        self._rebuild_view_env()
+        self.update()
+
+    def _scroll_by(self, dt: float):
+        """视图水平滚动 dt 秒（带边界钳制）。"""
+        if self.duration <= 0:
+            return
+        t0, t1 = self.view
+        span = t1 - t0
+        t0 = min(max(0.0, t0 + dt), max(0.0, self.duration - span))
+        self.view = [t0, t0 + span]
+        self._rebuild_view_env()
+        self.update()
+
+    def set_playhead(self, t: float, playing: bool = False):
+        """更新播放头；播放中若越出视图自动跟随滚动。"""
+        self.playhead = t
+        if playing and self.duration > 0:
+            t0, t1 = self.view
+            if t < t0 or t > t1:
+                span = t1 - t0
+                nt0 = min(max(0.0, t - span * 0.08), max(0.0, self.duration - span))
+                self.view = [nt0, nt0 + span]
+                self._rebuild_view_env()
+        self.update()
+
+    # ---------- 坐标换算 ----------
     def _x2t(self, x: float) -> float:
-        if self.duration <= 0 or self.width() <= 0:
+        t0, t1 = self.view
+        if t1 <= t0 or self.width() <= 0:
             return 0.0
-        return max(0.0, min(1.0, x / self.width())) * self.duration
+        f = max(0.0, min(1.0, x / self.width()))
+        return t0 + f * (t1 - t0)
 
     def _t2x(self, t: float) -> float:
-        if self.duration <= 0:
+        t0, t1 = self.view
+        if t1 <= t0:
             return 0
-        return t / self.duration * self.width()
+        return (t - t0) / (t1 - t0) * self.width()
 
     # ---------- 绘制 ----------
     def paintEvent(self, ev):  # noqa: N802
         p = QPainter(self)
         p.fillRect(self.rect(), QColor(18, 18, 22))
         w, h = self.width(), self.height()
-        mid = h / 2
-        # 选区着色
+        ruler_h = self._RULER_H if self.duration > 0 else 0
+        wh = h - ruler_h
+
         def shade(a, b, color):
             if a is None or b is None or self.duration <= 0:
                 return
             x1, x2 = self._t2x(min(a, b)), self._t2x(max(a, b))
-            p.fillRect(int(x1), 0, max(2, int(x2 - x1)), h, color)
+            p.fillRect(int(x1), 0, max(2, int(x2 - x1)), wh, color)
+
+        # 选区着色（画在波形之下）
         shade(*(self.speaker_ref or (None, None)), QColor(80, 200, 120, 70))
         shade(*(self.feature_ref or (None, None)), QColor(80, 140, 255, 70))
         shade(*(self.sel or (None, None)), QColor(255, 160, 40, 80))
-        # 波形
-        if self.envelope is not None:
-            p.setPen(QPen(QColor(60, 220, 130), 1))
-            n = len(self.envelope)
-            step = w / n
-            for i in range(n):
-                lo, hi = self.envelope[i]
-                x = int(i * step)
-                p.drawLine(x, int(mid + lo * mid * 0.95), x, int(mid + hi * mid * 0.95))
+
+        # 波形（单声道 1 行 / 立体声 L+R 两行）
+        if self.view_env:
+            lane_h = wh / len(self.view_env)
+            colors = (QColor(60, 220, 130), QColor(90, 180, 255))
+            for li, env in enumerate(self.view_env):
+                mid = li * lane_h + lane_h / 2
+                p.setPen(QPen(QColor(255, 255, 255, 26), 1))
+                p.drawLine(0, int(mid), w, int(mid))
+                if len(env):
+                    p.setPen(QPen(colors[min(li, 1)], 1))
+                    n = len(env)
+                    step = w / n
+                    amp = lane_h * 0.47
+                    for i in range(n):
+                        lo, hi = env[i]
+                        x = int(i * step)
+                        p.drawLine(x, int(mid + lo * amp), x, int(mid + hi * amp))
+                if self.stereo:
+                    p.setPen(QColor(170, 170, 170))
+                    p.drawText(4, int(li * lane_h + 13), "L" if li == 0 else "R")
         else:
             p.setPen(QColor(120, 120, 120))
-            p.drawText(self.rect(), Qt.AlignCenter, "打开音频/视频后显示波形（拖拽波形可选区间）")
-        # 播放头
+            p.drawText(self.rect(), Qt.AlignCenter,
+                       "打开音频/视频后显示波形（拖拽选区 · 滚轮滚动 · Ctrl+滚轮缩放）")
+
+        # 播放头（越出视图时在边缘画三角标记）
         p.setPen(QPen(QColor(255, 70, 70), 2))
-        x = self._t2x(self.playhead)
-        p.drawLine(int(x), 0, int(x), h)
+        px = self._t2x(self.playhead)
+        if 0 <= px <= w:
+            p.drawLine(int(px), 0, int(px), wh)
+        elif self.duration > 0:
+            p.setBrush(QColor(255, 70, 70))
+            ex = 0 if px < 0 else w
+            d = 6 if px < 0 else -6
+            p.drawPolygon([QPointF(ex, wh / 2 - 7), QPointF(ex, wh / 2 + 7), QPointF(ex + d, wh / 2)])
+
         # 拖拽预览线
         if self._drag_x is not None:
             p.setPen(QPen(QColor(255, 200, 60), 1))
-            p.drawLine(self._drag_x, 0, self._drag_x, h)
+            p.drawLine(self._drag_x, 0, self._drag_x, wh)
+
+        # 时间刻度尺
+        if ruler_h:
+            p.setPen(QPen(QColor(70, 70, 82), 1))
+            p.drawLine(0, wh, w, wh)
+            span = self.view[1] - self.view[0]
+            step = self._nice_step(span / max(1.0, w / 70.0))
+            t = math.ceil(self.view[0] / step) * step
+            p.setPen(QColor(155, 155, 155))
+            while t <= self.view[1] + 1e-9:
+                x = int(self._t2x(t))
+                p.drawLine(x, wh, x, wh + 5)
+                p.drawText(x + 3, h - 5, self._fmt_ruler(t, step))
+                t += step
+
+        # 左上角信息（播放头时间 + 缩放状态）
         p.setPen(QColor(150, 150, 150))
-        p.drawText(6, 14, self._fmt(self.playhead))
+        txt = self._fmt(self.playhead)
+        if self.duration > 0 and self.view[1] - self.view[0] < self.duration - 1e-6:
+            txt += f"   视图 {self.view[0]:.2f}~{self.view[1]:.2f}s"
+        p.drawText(6, 14, txt)
         p.end()
 
     @staticmethod
@@ -153,7 +304,24 @@ class WaveformWidget(QWidget):
         s = t - m * 60
         return f"{m:02d}:{s:06.3f}"
 
-    # ---------- 鼠标 ----------
+    @classmethod
+    def _nice_step(cls, target: float) -> float:
+        for s in cls._STEPS:
+            if s >= target:
+                return s
+        return cls._STEPS[-1]
+
+    @staticmethod
+    def _fmt_ruler(t: float, step: float) -> str:
+        m = int(t // 60)
+        s = t - m * 60
+        if step >= 1:
+            return f"{m:02d}:{int(s):02d}"
+        if step >= 0.1:
+            return f"{m:02d}:{s:04.1f}"
+        return f"{m:02d}:{s:05.2f}"
+
+    # ---------- 鼠标 / 滚轮 ----------
     def mousePressEvent(self, ev):  # noqa: N802
         if ev.button() == Qt.LeftButton:
             self._press_x = ev.position().x()
@@ -179,6 +347,23 @@ class WaveformWidget(QWidget):
         self._drag_x = None
         self.update()
 
+    def wheelEvent(self, ev):  # noqa: N802
+        if self.duration <= 0:
+            return
+        dy, dx = ev.angleDelta().y(), ev.angleDelta().x()
+        if ev.modifiers() & Qt.ControlModifier:
+            self._zoom_at(1.25 ** (dy / 120.0), self._x2t(ev.position().x()))
+        elif dy:
+            self._scroll_by(-(dy / 120.0) * (self.view[1] - self.view[0]) * 0.15)
+        elif dx:
+            self._scroll_by(-(dx / 120.0) * (self.view[1] - self.view[0]) * 0.15)
+
+    def resizeEvent(self, ev):  # noqa: N802
+        super().resizeEvent(ev)
+        if self.duration > 0:
+            self._rebuild_view_env()
+            self.update()
+
 
 # ================================================================ 主窗口
 
@@ -190,6 +375,7 @@ class MainWindow(QMainWindow):
 
         self.src: str | None = None          # 当前媒体
         self.info: ft.MediaInfo | None = None
+        self.fps: float = 0.0                # 当前视频帧率（帧步进用）
         self.wave_y: np.ndarray | None = None
         self.wave_sr = 16000
         self.speaker_ref: tuple[float, float] | None = None
@@ -220,7 +406,7 @@ class MainWindow(QMainWindow):
         left.addWidget(self.video, 6)
 
         self.wave = WaveformWidget()
-        self.wave.setMinimumHeight(120)
+        self.wave.setMinimumHeight(170)  # 立体声双行 + 时间刻度尺需要更高
         left.addWidget(self.wave, 2)
 
         ctl = QHBoxLayout()
@@ -248,6 +434,15 @@ class MainWindow(QMainWindow):
         for w in (self.btn_mute_sel, self.btn_cut_sel, self.btn_set_spk, self.btn_set_feat):
             act.addWidget(w)
         act.addStretch(1)
+        # 帧步进（音画对齐辅助）
+        self.btn_frame_back = QPushButton("« 帧")
+        self.btn_frame_back.setFixedWidth(52)
+        self.lbl_frame = QLabel("帧 --")
+        self.lbl_frame.setStyleSheet("color:#8a8aa0;")
+        self.btn_frame_fwd = QPushButton("帧 »")
+        self.btn_frame_fwd.setFixedWidth(52)
+        for w in (self.btn_frame_back, self.lbl_frame, self.btn_frame_fwd):
+            act.addWidget(w)
         left.addLayout(act)
 
         self.time_label = QLabel("00:00.000 / 00:00.000")
@@ -604,6 +799,8 @@ class MainWindow(QMainWindow):
         self.btn_cut_sel.clicked.connect(self.cut_selection)
         self.btn_set_spk.clicked.connect(self.set_speaker_ref)
         self.btn_set_feat.clicked.connect(self.set_feature_ref)
+        self.btn_frame_back.clicked.connect(lambda: self._frame_step(-1))
+        self.btn_frame_fwd.clicked.connect(lambda: self._frame_step(1))
 
         self.btn_apply_removal.clicked.connect(self.apply_removals)
         self.btn_modelscope.clicked.connect(self.apply_modelscope_enhance)
@@ -722,9 +919,15 @@ class MainWindow(QMainWindow):
             return
         self.log_append(f"打开: {self.src}  ({self.info.duration:.2f}s, "
                         f"视频={self.info.has_video}, 音频={self.info.has_audio})")
+        self.fps = self.info.fps if self.info.has_video else 0.0
+        if self.fps > 0:
+            self.lbl_frame.setText(f"帧 0 @ {self.fps:g}fps")
+        else:
+            self.lbl_frame.setText("帧 --")
         self.player.setSource(QUrl.fromLocalFile(self.src))
         self.wave.clear_all()
         self.wave.duration = self.info.duration
+        self.wave.view = [0.0, self.info.duration]
         self.speaker_ref = None
         self.feature_ref = None
         self._mark_in = None
@@ -741,7 +944,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _job_waveform(src: str, progress_cb=None):
-        return audio_ops.load_wav(src, 16000)
+        return audio_ops.load_wav(src, 16000, mono=False)  # 立体声双行显示
 
     def _after_waveform(self, res):
         y, sr = res
@@ -751,17 +954,28 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("就绪")
 
     def _pos_changed(self, ms: int):
-        self.wave.playhead = ms / 1000.0
+        playing = self.player.playbackState() == QMediaPlayer.PlayingState
+        self.wave.set_playhead(ms / 1000.0, playing)
         d = self.player.duration()
         if d > 0:
             self.time_label.setText(
                 f"{self._fmt_ms(ms)} / {self._fmt_ms(d)}  [{self.rate.currentText()}]")
-        self.wave.update()
+        if self.fps > 0:
+            self.lbl_frame.setText(f"帧 {int(round(ms * self.fps / 1000))} @ {self.fps:g}fps")
 
     @staticmethod
     def _fmt_ms(ms: int) -> str:
         s = ms / 1000.0
         return f"{int(s // 60):02d}:{s % 60:06.3f}"
+
+    def _frame_step(self, direction: int):
+        """按帧步进播放位置（音画对齐辅助）：direction=-1 上一帧 / +1 下一帧。"""
+        if self.fps <= 0:
+            QMessageBox.information(self, "提示", "当前文件无视频流，帧步进不可用")
+            return
+        step_ms = 1000.0 / self.fps
+        pos = self.player.position() + direction * step_ms
+        self.player.setPosition(int(max(0.0, min(pos, self.player.duration()))))
 
     def toggle_play(self):
         if self.player.playbackState() == QMediaPlayer.PlayingState:

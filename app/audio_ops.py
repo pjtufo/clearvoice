@@ -32,18 +32,21 @@ REMOVAL_TYPES = [
 ]
 
 
-def load_wav(path: str, sr: int = 16000) -> tuple[np.ndarray, int]:
-    """任意音/视频解码为单声道波形（临时 wav 经 ffmpeg 提取后读取并删除）。"""
+def load_wav(path: str, sr: int = 16000, mono: bool = True) -> tuple[np.ndarray, int]:
+    """任意音/视频解码为波形（临时 wav 经 ffmpeg 提取后读取并删除）。
+
+    mono=True 返回 (N,) 单声道；mono=False 保留声道，立体声返回 (N,2)。
+    """
     import subprocess, os
     from . import ffmpeg_tools as ft
     tmp = path + f"._{sr}.wav"
-    ft.extract_audio(path, tmp, sr=sr, mono=True)
+    ft.extract_audio(path, tmp, sr=sr, mono=mono)
     y, rate = sf.read(tmp, dtype="float32")
     try:
         os.remove(tmp)
     except OSError:
         pass
-    if y.ndim > 1:
+    if mono and y.ndim > 1:
         y = y.mean(axis=1)
     return y.astype(np.float64), rate
 

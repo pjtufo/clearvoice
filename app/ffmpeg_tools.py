@@ -41,6 +41,16 @@ def probe(path: str) -> dict:
     return json.loads(out.stdout.decode("utf-8", errors="replace"))
 
 
+def _parse_fps(text: str) -> float:
+    """解析 '30000/1001' 之类的帧率字符串，无效返回 0。"""
+    try:
+        num, den = text.split("/")
+        den = float(den)
+        return float(num) / den if den and float(num) else 0.0
+    except (ValueError, ZeroDivisionError):
+        return 0.0
+
+
 @dataclass
 class MediaInfo:
     path: str = ""
@@ -52,6 +62,7 @@ class MediaInfo:
     sample_rate: int = 0
     channels: int = 0
     format_name: str = ""
+    fps: float = 0.0
     streams: list = field(default_factory=list)
 
 
@@ -67,6 +78,8 @@ def media_info(path: str) -> MediaInfo:
             info.has_video = True
             info.width = int(st.get("width", 0) or 0)
             info.height = int(st.get("height", 0) or 0)
+            if info.fps <= 0:
+                info.fps = _parse_fps(st.get("avg_frame_rate") or st.get("r_frame_rate") or "")
             if info.duration <= 0:
                 info.duration = float(st.get("duration", 0) or 0)
         elif st.get("codec_type") == "audio":
