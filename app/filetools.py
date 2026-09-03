@@ -110,6 +110,23 @@ def plan_output(src_file: str, src_root: str, out_root: str,
     return unique_path(os.path.join(target_dir, out_name))
 
 
+def split_target(src_file: str, kind: str, use_subdir: bool = True,
+                 max_name_len: int = 0) -> tuple[str, str]:
+    """批量分割的输出定位，返回 (输出目录, 文件名前缀)。
+
+    use_subdir=True  → <源目录>/<源文件名主干>_<kind>分割/，前缀为空；
+    use_subdir=False → 输出到源目录，前缀为 <源文件名主干>_（区分不同源的分段）。
+    kind 如 "定长" / "特征" / "关键词"。
+    """
+    src_file = os.path.abspath(src_file)
+    stem = os.path.splitext(os.path.basename(src_file))[0]
+    stem = truncate_stem(stem, max_name_len)
+    src_dir = os.path.dirname(src_file)
+    if use_subdir:
+        return os.path.join(src_dir, f"{stem}_{kind}分割"), ""
+    return src_dir, f"{stem}_"
+
+
 # ---------------------------------------------------------------- 批量重命名
 
 def transform_stem(stem: str, mode: str, n: int = 0, m: int = 0,

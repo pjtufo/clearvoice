@@ -262,6 +262,43 @@ try:
 finally:
     shutil.rmtree(td, ignore_errors=True)
 
+print("14) 分割批处理（多文件/目录输入 + 输出定位）...", end=" ", flush=True)
+sd = tempfile.mkdtemp(prefix="cv_split_")
+try:
+    # split_target 纯逻辑：子目录模式 / 平铺前缀模式 / 长度截断
+    s_src = os.path.join(sd, "sub", "a.mp4")
+    d_out, d_pre = ftools.split_target(s_src, "定长", True, 0)
+    assert d_out == os.path.join(sd, "sub", "a_定长分割") and d_pre == ""
+    d_out2, d_pre2 = ftools.split_target(s_src, "特征", False, 0)
+    assert d_out2 == os.path.join(sd, "sub") and d_pre2 == "a_"
+    d_out3, _ = ftools.split_target(os.path.join(sd, "abcdefghij.wav"), "关键词", True, 4)
+    assert os.path.basename(d_out3) == "abcd_关键词分割"
+    # 造两个 3 秒 wav（含子目录），跑批量定长分割
+    import soundfile as sf
+    t3 = np.linspace(0, 3, 16000 * 3, endpoint=False)
+    wav1 = os.path.join(sd, "f1.wav")
+    wav2 = os.path.join(sd, "sub", "f2.wav")
+    os.makedirs(os.path.join(sd, "sub"), exist_ok=True)
+    sf.write(wav1, 0.01 * np.sin(2 * np.pi * 440 * t3), 16000)
+    sf.write(wav2, 0.01 * np.sin(2 * np.pi * 440 * t3), 16000)
+    files = ftools.scan_inputs([sd], ftools.MEDIA_EXTS, recursive=True)
+    assert len(files) == 2, files
+    res = main_window.MainWindow._job_split_fixed_batch(files, 1.0, True, 0,
+                                                        progress_cb=lambda *a: None)
+    assert isinstance(res, dict) and "成功 2" in res["report"], res["report"]
+    parts1 = sorted(os.listdir(os.path.join(sd, "f1_定长分割")))
+    parts2 = sorted(os.listdir(os.path.join(sd, "sub", "f2_定长分割")))
+    assert len(parts1) == 3 and all(p.startswith("part_") and p.endswith(".wav") for p in parts1)
+    assert len(parts2) == 3
+    # 不建子目录：分段直接放源目录并带源名前缀
+    res2 = main_window.MainWindow._job_split_fixed_batch([wav1], 1.5, False, 0,
+                                                         progress_cb=lambda *a: None)
+    flat = [p for p in os.listdir(sd) if p.startswith("f1_part_")]
+    assert len(flat) == 2, flat
+    print("ok")
+finally:
+    shutil.rmtree(sd, ignore_errors=True)
+
 os.remove(test_wav)
 os.remove(out_mute)
 print("\nALL TESTS PASSED")

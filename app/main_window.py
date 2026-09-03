@@ -1,6 +1,6 @@
 """ClearVoice 主界面（PySide6）。
 
-功能页签：消除杂音（多类型 DSP + 去背景音乐）/ 分割（定长/特征/关键词正则，输出子目录可选）/
+功能页签：消除杂音（多类型 DSP + 去背景音乐）/ 分割（批量文件·目录，定长/特征/关键词正则，输出子目录可选）/
 合并分离 / 格式转换（批量·目录递归·保持结构）/ 文件名夹处理（批量重命名）/
 时间轴（变速 / 音画同步微调 / 裁剪）/
 特征剔除 / 语音转文字 / 翻译 / TTS / 设置。
@@ -652,6 +652,23 @@ class MainWindow(QMainWindow):
         # Tab2 分割
         t2 = QWidget()
         f2 = QVBoxLayout(t2)
+        g2src = QGroupBox("分割源文件（支持文件与目录，目录递归穷举子目录；列表留空 = 分割当前打开的文件）")
+        v2src = QGridLayout(g2src)
+        self.lst_split = QListWidget()
+        self.lst_split.setMinimumHeight(90)
+        self.lst_split.setSelectionMode(QListWidget.ExtendedSelection)
+        v2src.addWidget(self.lst_split, 0, 0, 1, 3)
+        self.btn_split_add = QPushButton("添加文件…")
+        self.btn_split_adddir = QPushButton("添加目录…")
+        self.btn_split_del = QPushButton("移除所选")
+        self.btn_split_clr = QPushButton("清空")
+        v2src.addWidget(self.btn_split_add, 1, 0)
+        v2src.addWidget(self.btn_split_adddir, 1, 1)
+        v2src.addWidget(self.btn_split_del, 1, 2)
+        v2src.addWidget(self.btn_split_clr, 2, 0)
+        self.chk_split_recurse = QCheckBox("递归子目录"); self.chk_split_recurse.setChecked(True)
+        v2src.addWidget(self.chk_split_recurse, 2, 1)
+        f2.addWidget(g2src)
         g2 = QGroupBox("定长分割")
         v2 = QVBoxLayout(g2)
         h2 = QHBoxLayout()
@@ -1105,6 +1122,10 @@ class MainWindow(QMainWindow):
         self.btn_split_fixed.clicked.connect(self.split_fixed)
         self.btn_split_feat.clicked.connect(self.split_by_feature)
         self.btn_split_kw.clicked.connect(self.split_keyword)
+        self.btn_split_add.clicked.connect(self._split_add_files)
+        self.btn_split_adddir.clicked.connect(self._split_add_dir)
+        self.btn_split_del.clicked.connect(self._split_del_selected)
+        self.btn_split_clr.clicked.connect(self.lst_split.clear)
         self.btn_merge_av.clicked.connect(self.merge_av)
         self.btn_extract.clicked.connect(self.extract_audio)
         self.btn_conv_add.clicked.connect(self._conv_add_files)
@@ -1455,50 +1476,174 @@ class MainWindow(QMainWindow):
         return out
 
     # ---------------------------------------------------------------- 分割
-    def _split_targets(self, kind: str) -> tuple[str, str]:
+    def _split_add_files(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "选择要分割的媒体文件", "", "媒体文件 (*)")
+        existing = {self.lst_split.item(i).text() for i in range(self.lst_split.count())}
+        for f in files:
+            f = os.path.abspath(f)
+            if f not in existing:
+                self.lst_split.addItem(f)
+                existing.add(f)
+
+    def _split_add_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择媒体目录（递归扫描子目录）", "")
+        if d:
+            d = os.path.abspath(d)
+            existing = {self.lst_split.item(i).text() for i in range(self.lst_split.count())}
+            if d not in existing:
+                self.lst_split.addItem(d)
+
+    def _split_del_selected(self):
+        for item in self.lst_split.selectedItems():
+            self.lst_split.takeItem(self.lst_split.row(item))
+
+    def _split_collect(self) -> list[str] | None:
+        """收集分割源：列表（文件+目录递归扫描）；列表为空时回退到当前打开的文件。"""
+        from . import filetools
+        inputs = [self.lst_split.item(i).text() for i in range(self.lst_split.count())]
+        if inputs:
+            missing = [p for p in inputs if not os.path.exists(p)]
+            if missing:
+                QMessageBox.warning(self, "提示", "以下路径不存在：\n" + "\n".join(missing[:5]))
+                return None
+            files = filetools.scan_inputs(inputs, filetools.MEDIA_EXTS,
+                                          recursive=self.chk_split_recurse.isChecked())
+            if not files:
+                QMessageBox.information(self, "提示", "所选路径中没有可分割的音视频文件")
+                return None
+            return files
+        if not self.src:
+            QMessageBox.information(self, "提示",
+                                    "请先添加要分割的文件/目录，或打开一个媒体文件")
+            return None
+        return [os.path.abspath(self.src)]
+
+    def _split_opts(self) -> tuple[bool, int]:
+        use_subdir = self.chk_split_subdir.isChecked()
+        name_len = int(self.spin_split_namelen.value()) if self.chk_split_namelen.isChecked() else 0
+        return use_subdir, name_len
+
+    def _split_targets(self, kind: str, src: str | None = None) -> tuple[str, str]:
         """按分割输出选项返回 (输出目录, 文件名前缀)。
 
         勾选子目录：<src目录>/<源文件名>_<kind>分割/，前缀为空；
         不勾选：输出到源目录，前缀为 <源文件名>_（避免多文件混淆）。
         """
         from . import filetools
-        stem = os.path.splitext(os.path.basename(self.src or ""))[0]
-        name_len = int(self.spin_split_namelen.value()) if self.chk_split_namelen.isChecked() else 0
-        stem = filetools.truncate_stem(stem, name_len) if name_len else stem
-        src_dir = os.path.dirname(os.path.abspath(self.src))
-        if self.chk_split_subdir.isChecked():
-            return os.path.join(src_dir, f"{stem}_{kind}分割"), ""
-        return src_dir, f"{stem}_"
+        use_subdir, name_len = self._split_opts()
+        return filetools.split_target(src or self.src or "", kind, use_subdir, name_len)
+
+    @staticmethod
+    def _split_report(title: str, done: list, failed: list, skipped: list | None = None) -> dict:
+        skipped = skipped or []
+        lines = [f"{title}：共 {len(done) + len(failed) + len(skipped)} 个文件，"
+                 f"成功 {len(done)}，跳过 {len(skipped)}，失败 {len(failed)}", ""]
+        for item in done:
+            lines.append(f"✓ {item[0]}  {item[1]}")
+        for name, info in skipped:
+            lines.append(f"○ {name}  {info}")
+        for name, err in failed:
+            lines.append(f"✗ {name}  {err}")
+        first_out = done[0][2] if done and len(done[0]) > 2 else ""
+        return {"output": first_out, "report": "\n".join(lines)}
 
     def split_fixed(self):
-        if not self._require_src():
+        files = self._split_collect()
+        if not files:
             return
         seg = float(self.spin_seg.value())
-        out_dir, prefix = self._split_targets("定长")
-        os.makedirs(out_dir, exist_ok=True)
-        base = f"{prefix}part" if prefix else "part"
-        self._run("定长分割",
-                  lambda src, d, s, b, progress_cb=None: ft.split_fixed(src, d, s, base=b),
-                  self.src, out_dir, seg, base)
+        use_subdir, name_len = self._split_opts()
+        self._run("定长分割", self._job_split_fixed_batch, files, seg, use_subdir, name_len)
+
+    @staticmethod
+    def _job_split_fixed_batch(files, seg, use_subdir, name_len, progress_cb=None):
+        from . import filetools
+        n = len(files)
+        done, failed = [], []
+        for i, src in enumerate(files):
+            name = os.path.basename(src)
+            try:
+                out_dir, prefix = filetools.split_target(src, "定长", use_subdir, name_len)
+                base = f"{prefix}part" if prefix else "part"
+                outs = ft.split_fixed(src, out_dir, seg, base=base)
+                done.append((name, f"→ {len(outs)} 段 → {out_dir}", outs[0] if outs else ""))
+            except Exception as e:
+                failed.append((name, str(e)))
+            progress_cb(int(100 * (i + 1) / n), f"定长分割 {i + 1}/{n} 完成")
+        progress_cb(100, "定长分割完成")
+        return MainWindow._split_report("定长分割", done, failed)
 
     def split_by_feature(self):
-        if not self._require_src():
+        files = self._split_collect()
+        if not files:
             return
         mode = self.cmb_feat_split.currentText()
-        if mode != "静音边界" and self.speaker_ref is None and mode == "说话人参考区间":
+        if mode == "说话人参考区间" and self.speaker_ref is None:
             QMessageBox.information(self, "提示", "请先设置说话人参考区间")
             return
         if mode == "相似特征参考" and self.feature_ref is None and self.feature_ref_file is None:
             QMessageBox.information(self, "提示", "请先设置相似特征参考区间或导入参考文件")
             return
-        out_dir, prefix = self._split_targets("特征")
-        self._run("特征分割", self._job_split_feat, self.src, out_dir, mode,
+        use_subdir, name_len = self._split_opts()
+        # 参考音频统一取自设置标记的文件（当前打开的文件）；未打开则取列表第一个
+        ref_src = os.path.abspath(self.src) if self.src else files[0]
+        self._run("特征分割", self._job_split_feat_batch, files, mode,
                   self.speaker_ref, self.feature_ref, self.feature_ref_file,
-                  float(self.spin_sim_thr.value()), prefix)
+                  float(self.spin_sim_thr.value()), use_subdir, name_len, ref_src)
+
+    @staticmethod
+    def _job_split_feat_batch(files, mode, spk_ref, feat_ref, feat_file, sim_thr,
+                              use_subdir, name_len, ref_src, progress_cb=None):
+        from . import filetools
+        import soundfile as sf
+        # 批量分割时参考音频只提取一次（说话人区间/相似区间均取自标记所在的源文件）
+        ref_audio = None
+        if mode == "说话人参考区间" and spk_ref:
+            tmp = ref_src + ".ref.wav"
+            ft.extract_audio(ref_src, tmp, sr=16000, start=spk_ref[0], end=spk_ref[1])
+            ref, _ = sf.read(tmp, dtype="float32")
+            if ref.ndim > 1:
+                ref = ref.mean(axis=1)
+            ref_audio = (ref, 16000)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        elif mode == "相似特征参考" and not feat_file and feat_ref:
+            tmp = ref_src + ".feat.wav"
+            ft.extract_audio(ref_src, tmp, sr=16000, start=feat_ref[0], end=feat_ref[1])
+            ref, _ = sf.read(tmp, dtype="float32")
+            if ref.ndim > 1:
+                ref = ref.mean(axis=1)
+            ref_audio = (ref, 16000)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        n = len(files)
+        done, failed = [], []
+        for i, src in enumerate(files):
+            name = os.path.basename(src)
+
+            def cb(p, m="", _i=i):
+                progress_cb(min(99, int(100 * _i / n) + int(p / n)),
+                            f"[{_i + 1}/{n}] {name}: {m}")
+
+            try:
+                out_dir, prefix = filetools.split_target(src, "特征", use_subdir, name_len)
+                outs = MainWindow._job_split_feat(src, out_dir, mode, spk_ref, feat_ref,
+                                                  feat_file, sim_thr, prefix,
+                                                  progress_cb=cb, ref_audio=ref_audio)
+                done.append((name, f"→ {len(outs)} 段 → {out_dir}", outs[0] if outs else ""))
+            except Exception as e:
+                failed.append((name, str(e)))
+            progress_cb(int(100 * (i + 1) / n), f"特征分割 {i + 1}/{n} 完成")
+        progress_cb(100, "特征分割完成")
+        return MainWindow._split_report("特征分割", done, failed)
 
     @staticmethod
     def _job_split_feat(src, out_dir, mode, spk_ref, feat_ref, feat_file, sim_thr,
-                        prefix="", progress_cb=None):
+                        prefix="", progress_cb=None, ref_audio=None):
         import soundfile as sf
         y, sr = audio_ops.load_wav(src, 16000)
         total = len(y) / sr
@@ -1506,16 +1651,19 @@ class MainWindow(QMainWindow):
         if mode == "静音边界":
             ranges = features.detect_silence(y, sr)
         elif mode == "说话人参考区间":
-            tmp = src + ".ref.wav"
-            ft.extract_audio(src, tmp, sr=16000, start=spk_ref[0], end=spk_ref[1])
-            ref, _ = sf.read(tmp, dtype="float32")
-            if ref.ndim > 1:
-                ref = ref.mean(axis=1)
+            if ref_audio is not None:
+                ref, _ = ref_audio
+            else:
+                tmp = src + ".ref.wav"
+                ft.extract_audio(src, tmp, sr=16000, start=spk_ref[0], end=spk_ref[1])
+                ref, _ = sf.read(tmp, dtype="float32")
+                if ref.ndim > 1:
+                    ref = ref.mean(axis=1)
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
             ranges = features.find_similar_segments(y, sr, ref, sr, threshold=0.80)
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
         else:
             if feat_file:
                 ref, rsr = sf.read(feat_file, dtype="float32")
@@ -1525,6 +1673,8 @@ class MainWindow(QMainWindow):
                     n_new = int(len(ref) * sr / rsr)
                     ref = np.interp(np.arange(n_new) / sr,
                                     np.arange(len(ref)) / rsr, ref)
+            elif ref_audio is not None:
+                ref, _ = ref_audio
             else:
                 tmp = src + ".feat.wav"
                 ft.extract_audio(src, tmp, sr=16000, start=feat_ref[0], end=feat_ref[1])
@@ -1554,7 +1704,8 @@ class MainWindow(QMainWindow):
                 "正则前分割": "head", "正则后分割": "tail", "抹正则分割": "erase"}
 
     def split_keyword(self):
-        if not self._require_src():
+        files = self._split_collect()
+        if not files:
             return
         pat = self.ed_kw.text().strip()
         if not pat:
@@ -1572,9 +1723,39 @@ class MainWindow(QMainWindow):
                                 "关键词分割需要魔塔语音识别模型。\n\n请先执行:\n  uv sync --extra modelscope\n\n"
                                 f"模型: {msa.ASR_MODEL_ID}")
             return
-        out_dir, prefix = self._split_targets("关键词")
-        self._run(f"关键词分割({mode})", self._job_split_keyword, self.src, out_dir, mode, pat,
-                  float(self.spin_kw_pb.value()), float(self.spin_kw_pa.value()), prefix)
+        use_subdir, name_len = self._split_opts()
+        self._run(f"关键词分割({mode})", self._job_split_keyword_batch, files, mode, pat,
+                  float(self.spin_kw_pb.value()), float(self.spin_kw_pa.value()),
+                  use_subdir, name_len)
+
+    @staticmethod
+    def _job_split_keyword_batch(files, mode, pattern, pad_b, pad_a,
+                                 use_subdir, name_len, progress_cb=None):
+        from . import filetools
+        n = len(files)
+        done, failed, skipped = [], [], []
+        for i, src in enumerate(files):
+            name = os.path.basename(src)
+
+            def cb(p, m="", _i=i):
+                progress_cb(min(99, int(100 * _i / n) + int(p / n)),
+                            f"[{_i + 1}/{n}] {name}: {m}")
+
+            try:
+                out_dir, prefix = filetools.split_target(src, "关键词", use_subdir, name_len)
+                res = MainWindow._job_split_keyword(src, out_dir, mode, pattern,
+                                                    pad_b, pad_a, prefix, progress_cb=cb)
+                if isinstance(res, dict):
+                    mcnt = re.search(r"输出\s*(\d+)\s*段", res.get("report", ""))
+                    seg_n = mcnt.group(1) if mcnt else "?"
+                    done.append((name, f"→ {seg_n} 段 → {out_dir}", res.get("output", "")))
+                else:
+                    skipped.append((name, str(res)))
+            except Exception as e:
+                failed.append((name, str(e)))
+            progress_cb(int(100 * (i + 1) / n), f"关键词分割 {i + 1}/{n} 完成")
+        progress_cb(100, "关键词分割完成")
+        return MainWindow._split_report(f"关键词分割（{mode}）", done, failed, skipped)
 
     @staticmethod
     def _job_split_keyword(src, out_dir, mode, pattern, pad_b, pad_a,
