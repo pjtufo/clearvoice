@@ -4,6 +4,8 @@
 合并分离 / 格式转换（批量·目录递归·保持结构）/ 文件名夹处理（批量重命名）/
 时间轴（变速 / 音画同步微调 / 裁剪）/
 特征剔除 / 语音转文字 / 翻译 / TTS / 设置。
+各页签的源文件统一使用 SourceFileGroup：支持单个/多个文件与目录（递归穷举子目录），
+列表留空时回退到当前打开的文件；批量任务逐文件执行、单文件失败不影响整体、统一汇总报告。
 左栏：播放控制、波形选区（含可拖拽概览条）、说话人与特征参考标记、进度与日志。
 """
 from __future__ import annotations
@@ -527,6 +529,65 @@ class WaveformWidget(QWidget):
 
 # ================================================================ 主窗口
 
+class SourceFileGroup(QGroupBox):
+    """可复用的源文件选择组：文件+目录混合，目录递归穷举子目录。
+
+    各功能页签统一使用本组件获取源文件；列表留空时由调用方回退到当前打开的文件。
+    """
+
+    def __init__(self, title: str = "源文件（支持单个/多个文件与目录，目录递归穷举子目录；"
+                                    "列表留空 = 当前打开的文件）", parent=None):
+        super().__init__(title, parent)
+        grid = QGridLayout(self)
+        self.list = QListWidget()
+        self.list.setMinimumHeight(84)
+        self.list.setSelectionMode(QListWidget.ExtendedSelection)
+        grid.addWidget(self.list, 0, 0, 1, 3)
+        self.btn_add = QPushButton("添加文件…")
+        self.btn_adddir = QPushButton("添加目录…")
+        self.btn_del = QPushButton("移除所选")
+        self.btn_clr = QPushButton("清空")
+        grid.addWidget(self.btn_add, 1, 0)
+        grid.addWidget(self.btn_adddir, 1, 1)
+        grid.addWidget(self.btn_del, 1, 2)
+        grid.addWidget(self.btn_clr, 2, 0)
+        self.chk_recurse = QCheckBox("递归子目录")
+        self.chk_recurse.setChecked(True)
+        grid.addWidget(self.chk_recurse, 2, 1)
+        self.btn_add.clicked.connect(self.add_files)
+        self.btn_adddir.clicked.connect(self.add_dir)
+        self.btn_del.clicked.connect(self.remove_selected)
+        self.btn_clr.clicked.connect(self.list.clear)
+
+    def add_files(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "选择媒体文件", "", "媒体文件 (*)")
+        existing = set(self.paths())
+        for f in files:
+            f = os.path.abspath(f)
+            if f not in existing:
+                self.list.addItem(f)
+                existing.add(f)
+
+    def add_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择媒体目录（递归扫描子目录）", "")
+        if d:
+            d = os.path.abspath(d)
+            if d not in set(self.paths()):
+                self.list.addItem(d)
+
+    def remove_selected(self):
+        for item in self.list.selectedItems():
+            self.list.takeItem(self.list.row(item))
+
+    def paths(self) -> list[str]:
+        return [self.list.item(i).text() for i in range(self.list.count())]
+
+    def scan(self, exts=None) -> list[str]:
+        from . import filetools
+        return filetools.scan_inputs(self.paths(), exts or filetools.MEDIA_EXTS,
+                                     recursive=self.chk_recurse.isChecked())
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -616,6 +677,9 @@ class MainWindow(QMainWindow):
         # Tab1 消除杂音
         t1 = QWidget()
         f1 = QVBoxLayout(t1)
+        self.grp_removal = SourceFileGroup(
+            "处理源文件（支持单个/多个文件与目录，目录递归穷举子目录；列表留空 = 当前打开的文件）")
+        f1.addWidget(self.grp_removal)
         g1 = QGroupBox("选择要消除的声音类型（可多选）")
         gv = QVBoxLayout(g1)
         self.chk: dict[str, QCheckBox] = {}
@@ -652,23 +716,9 @@ class MainWindow(QMainWindow):
         # Tab2 分割
         t2 = QWidget()
         f2 = QVBoxLayout(t2)
-        g2src = QGroupBox("分割源文件（支持文件与目录，目录递归穷举子目录；列表留空 = 分割当前打开的文件）")
-        v2src = QGridLayout(g2src)
-        self.lst_split = QListWidget()
-        self.lst_split.setMinimumHeight(90)
-        self.lst_split.setSelectionMode(QListWidget.ExtendedSelection)
-        v2src.addWidget(self.lst_split, 0, 0, 1, 3)
-        self.btn_split_add = QPushButton("添加文件…")
-        self.btn_split_adddir = QPushButton("添加目录…")
-        self.btn_split_del = QPushButton("移除所选")
-        self.btn_split_clr = QPushButton("清空")
-        v2src.addWidget(self.btn_split_add, 1, 0)
-        v2src.addWidget(self.btn_split_adddir, 1, 1)
-        v2src.addWidget(self.btn_split_del, 1, 2)
-        v2src.addWidget(self.btn_split_clr, 2, 0)
-        self.chk_split_recurse = QCheckBox("递归子目录"); self.chk_split_recurse.setChecked(True)
-        v2src.addWidget(self.chk_split_recurse, 2, 1)
-        f2.addWidget(g2src)
+        self.grp_split = SourceFileGroup(
+            "分割源文件（支持单个/多个文件与目录，目录递归穷举子目录；列表留空 = 分割当前打开的文件）")
+        f2.addWidget(self.grp_split)
         g2 = QGroupBox("定长分割")
         v2 = QVBoxLayout(g2)
         h2 = QHBoxLayout()
@@ -748,6 +798,9 @@ class MainWindow(QMainWindow):
         btn_v.clicked.connect(lambda: self._pick_into(self.ed_video, "视频", ft.VIDEO_EXTS))
         btn_a.clicked.connect(lambda: self._pick_into(self.ed_audio, "音频", ft.AUDIO_EXTS))
         f3.addWidget(g4)
+        self.grp_extract = SourceFileGroup(
+            "分离源文件（支持单个/多个文件与目录；列表留空 = 当前打开的文件）")
+        f3.addWidget(self.grp_extract)
         g5 = QGroupBox("分离音频（保留视频原始采样率 / 声道）")
         v5 = QGridLayout(g5)
         v5.addWidget(QLabel("输出格式"), 0, 0)
@@ -755,7 +808,7 @@ class MainWindow(QMainWindow):
         for _ext, _desc in ft.AUDIO_OUT_FORMATS.items():
             self.cmb_extract_fmt.addItem(f"{_desc}（*{_ext}）", _ext)
         v5.addWidget(self.cmb_extract_fmt, 0, 1)
-        self.btn_extract = QPushButton("从当前文件分离音频")
+        self.btn_extract = QPushButton("分离音频（批量处理上方列表）")
         v5.addWidget(self.btn_extract, 1, 0, 1, 2)
         f3.addWidget(g5)
         f3.addStretch(1)
@@ -766,41 +819,29 @@ class MainWindow(QMainWindow):
         fconv = QVBoxLayout(tconv)
         gconv = QGroupBox("批量格式转换（视频转音频 / 音频转音频，支持文件与目录）")
         vconv = QGridLayout(gconv)
-        self.lst_convert = QListWidget()
-        self.lst_convert.setMinimumHeight(100)
-        self.lst_convert.setSelectionMode(QListWidget.ExtendedSelection)
-        vconv.addWidget(self.lst_convert, 0, 0, 1, 3)
-        self.btn_conv_add = QPushButton("添加文件…")
-        self.btn_conv_adddir = QPushButton("添加目录…")
-        self.btn_conv_del = QPushButton("移除所选")
-        self.btn_conv_clr = QPushButton("清空")
-        vconv.addWidget(self.btn_conv_add, 1, 0)
-        vconv.addWidget(self.btn_conv_adddir, 1, 1)
-        vconv.addWidget(self.btn_conv_del, 1, 2)
-        vconv.addWidget(self.btn_conv_clr, 2, 0)
-        self.chk_conv_recurse = QCheckBox("递归子目录"); self.chk_conv_recurse.setChecked(True)
-        vconv.addWidget(self.chk_conv_recurse, 2, 1)
+        self.grp_convert = SourceFileGroup()
+        vconv.addWidget(self.grp_convert, 0, 0, 1, 3)
         self.chk_conv_keepstruct = QCheckBox("输出保持相对目录结构"); self.chk_conv_keepstruct.setChecked(True)
-        vconv.addWidget(self.chk_conv_keepstruct, 2, 2)
-        vconv.addWidget(QLabel("输出根目录"), 3, 0)
+        vconv.addWidget(self.chk_conv_keepstruct, 1, 0, 1, 3)
+        vconv.addWidget(QLabel("输出根目录"), 2, 0)
         self.ed_conv_outroot = QLineEdit(); self.ed_conv_outroot.setPlaceholderText("留空 = 输出到源文件同目录")
         btn_conv_outroot = QPushButton("浏览…"); btn_conv_outroot.setFixedWidth(64)
-        vconv.addWidget(self.ed_conv_outroot, 3, 1)
-        vconv.addWidget(btn_conv_outroot, 3, 2)
-        vconv.addWidget(QLabel("输出格式"), 4, 0)
+        vconv.addWidget(self.ed_conv_outroot, 2, 1)
+        vconv.addWidget(btn_conv_outroot, 2, 2)
+        vconv.addWidget(QLabel("输出格式"), 3, 0)
         self.cmb_conv_fmt = QComboBox()
         for _ext, _desc in ft.AUDIO_OUT_FORMATS.items():
             self.cmb_conv_fmt.addItem(f"{_desc}（*{_ext}）", _ext)
-        vconv.addWidget(self.cmb_conv_fmt, 4, 1, 1, 2)
-        vconv.addWidget(QLabel("码率"), 5, 0)
+        vconv.addWidget(self.cmb_conv_fmt, 3, 1, 1, 2)
+        vconv.addWidget(QLabel("码率"), 4, 0)
         self.cmb_conv_br = QComboBox()
         self.cmb_conv_br.setEditable(True)
         self.cmb_conv_br.addItems(["源 / 默认", "128k", "192k", "256k", "320k"])
-        vconv.addWidget(self.cmb_conv_br, 5, 1, 1, 2)
-        vconv.addWidget(QLabel("采样率"), 6, 0)
+        vconv.addWidget(self.cmb_conv_br, 4, 1, 1, 2)
+        vconv.addWidget(QLabel("采样率"), 5, 0)
         self.cmb_conv_sr = QComboBox()
         self.cmb_conv_sr.addItems(["源", "8000", "16000", "22050", "32000", "44100", "48000"])
-        vconv.addWidget(self.cmb_conv_sr, 6, 1, 1, 2)
+        vconv.addWidget(self.cmb_conv_sr, 5, 1, 1, 2)
         h_den = QHBoxLayout()
         self.chk_conv_denoise = QCheckBox("启用降噪（强度）")
         self.spin_conv_denoise = QDoubleSpinBox()
@@ -809,7 +850,7 @@ class MainWindow(QMainWindow):
         h_den.addWidget(self.chk_conv_denoise)
         h_den.addWidget(self.spin_conv_denoise)
         h_den.addStretch(1)
-        vconv.addLayout(h_den, 7, 0, 1, 3)
+        vconv.addLayout(h_den, 6, 0, 1, 3)
         h_name = QHBoxLayout()
         self.chk_conv_namelen = QCheckBox("限制输出文件名长度（主干字符数，0=不限）")
         self.spin_conv_namelen = QSpinBox(); self.spin_conv_namelen.setRange(0, 200)
@@ -817,13 +858,13 @@ class MainWindow(QMainWindow):
         h_name.addWidget(self.chk_conv_namelen)
         h_name.addWidget(self.spin_conv_namelen)
         h_name.addStretch(1)
-        vconv.addLayout(h_name, 8, 0, 1, 3)
+        vconv.addLayout(h_name, 7, 0, 1, 3)
         self.btn_convert = QPushButton("开始转换")
-        vconv.addWidget(self.btn_convert, 9, 0, 1, 3)
+        vconv.addWidget(self.btn_convert, 8, 0, 1, 3)
         lbl_conv_tip = QLabel("添加目录时递归穷举子目录中的音视频文件；输出在根目录下按源相对路径"
                               "重建目录结构；同名文件自动加序号；码率/采样率默认跟随源。")
         lbl_conv_tip.setWordWrap(True)
-        vconv.addWidget(lbl_conv_tip, 10, 0, 1, 3)
+        vconv.addWidget(lbl_conv_tip, 9, 0, 1, 3)
         fconv.addWidget(gconv)
         fconv.addStretch(1)
         tabs.addTab(tconv, "格式转换")
@@ -886,6 +927,9 @@ class MainWindow(QMainWindow):
         # Tab4 时间轴
         t4 = QWidget()
         f4 = QVBoxLayout(t4)
+        self.grp_timeline = SourceFileGroup(
+            "处理源文件（变速/音画同步支持批量；试听预览与裁剪针对当前打开的文件；列表留空 = 当前打开的文件）")
+        f4.addWidget(self.grp_timeline)
         g6 = QGroupBox("调整时间轴速度（视频+音频同步变速）")
         v6 = QGridLayout(g6)
         v6.addWidget(QLabel("倍速"), 0, 0)
@@ -922,6 +966,9 @@ class MainWindow(QMainWindow):
         # Tab5 特征剔除
         t8 = QWidget()
         f8 = QVBoxLayout(t8)
+        self.grp_feature = SourceFileGroup(
+            "处理源文件（支持单个/多个文件与目录，目录递归穷举子目录；列表留空 = 当前打开的文件）")
+        f8.addWidget(self.grp_feature)
         g8 = QGroupBox("按语言文字特征剔除（需要魔塔 ASR 模型）")
         v8 = QVBoxLayout(g8)
         self.ed_keywords = QLineEdit(); self.ed_keywords.setPlaceholderText("输入关键词，用逗号分隔，例如: 保密,内部资料")
@@ -958,15 +1005,9 @@ class MainWindow(QMainWindow):
         # Tab6 语音转文字
         t9 = QWidget()
         f9 = QVBoxLayout(t9)
-        g10 = QGroupBox("识别输入（音频或视频，需要魔塔 ASR 模型）")
-        v10 = QGridLayout(g10)
-        self.ed_asr_src = QLineEdit(); self.ed_asr_src.setPlaceholderText("要识别的音频/视频文件")
-        btn_asr_pick = QPushButton("浏览…"); btn_asr_pick.setFixedWidth(64)
-        btn_asr_cur = QPushButton("使用当前文件"); btn_asr_cur.setFixedWidth(110)
-        v10.addWidget(self.ed_asr_src, 0, 0)
-        v10.addWidget(btn_asr_pick, 0, 1)
-        v10.addWidget(btn_asr_cur, 0, 2)
-        f9.addWidget(g10)
+        self.grp_asr = SourceFileGroup(
+            "识别源文件（支持单个/多个文件与目录，目录递归穷举子目录；列表留空 = 当前打开的文件）")
+        f9.addWidget(self.grp_asr)
         g11 = QGroupBox("输出格式（可多选）")
         v11 = QVBoxLayout(g11)
         self.chk_out_txt = QCheckBox("文本文档 (*.txt)"); self.chk_out_txt.setChecked(True)
@@ -979,8 +1020,6 @@ class MainWindow(QMainWindow):
         f9.addStretch(1)
         tabs.addTab(t9, "语音转文字")
 
-        btn_asr_pick.clicked.connect(self._pick_asr_src)
-        btn_asr_cur.clicked.connect(self._asr_use_current)
         self.btn_asr_run.clicked.connect(self.run_asr_export)
 
         # Tab 翻译 / TTS
@@ -1122,16 +1161,8 @@ class MainWindow(QMainWindow):
         self.btn_split_fixed.clicked.connect(self.split_fixed)
         self.btn_split_feat.clicked.connect(self.split_by_feature)
         self.btn_split_kw.clicked.connect(self.split_keyword)
-        self.btn_split_add.clicked.connect(self._split_add_files)
-        self.btn_split_adddir.clicked.connect(self._split_add_dir)
-        self.btn_split_del.clicked.connect(self._split_del_selected)
-        self.btn_split_clr.clicked.connect(self.lst_split.clear)
         self.btn_merge_av.clicked.connect(self.merge_av)
         self.btn_extract.clicked.connect(self.extract_audio)
-        self.btn_conv_add.clicked.connect(self._conv_add_files)
-        self.btn_conv_adddir.clicked.connect(self._conv_add_dir)
-        self.btn_conv_del.clicked.connect(self._conv_del_selected)
-        self.btn_conv_clr.clicked.connect(self.lst_convert.clear)
         self.btn_convert.clicked.connect(self.convert_media_batch)
         self.btn_rn_preview.clicked.connect(self.rename_preview)
         self.btn_rn_apply.clicked.connect(self.rename_apply)
@@ -1174,6 +1205,62 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "提示", "请先打开音频或视频文件")
             return False
         return True
+
+    def _collect_source(self, group: "SourceFileGroup") -> list[str] | None:
+        """统一源收集：组内文件/目录 → 递归扫描媒体文件；列表为空回退当前打开的文件。"""
+        from . import filetools
+        inputs = group.paths()
+        if inputs:
+            missing = [p for p in inputs if not os.path.exists(p)]
+            if missing:
+                QMessageBox.warning(self, "提示", "以下路径不存在：\n" + "\n".join(missing[:5]))
+                return None
+            files = group.scan(filetools.MEDIA_EXTS)
+            if not files:
+                QMessageBox.information(self, "提示", "所选路径中没有可处理的音视频文件")
+                return None
+            return files
+        if not self.src:
+            QMessageBox.information(self, "提示", "请先添加源文件/目录，或打开一个媒体文件")
+            return None
+        return [os.path.abspath(self.src)]
+
+    @staticmethod
+    def _batch_loop(title: str, files: list[str], fn, progress_cb=None) -> dict:
+        """批量执行：fn(src, cb) 返回 ("ok"|"skip", 说明)；抛异常记为失败。
+
+        cb(percent, msg) 为单文件内部进度回调，自动换算为总进度 [i/N]。
+        """
+        done, failed, skipped = [], [], []
+        total = max(1, len(files))
+        for i, src in enumerate(files):
+            name = os.path.basename(src)
+
+            def cb(p, m="", _i=i):
+                progress_cb(min(99, int(100 * _i / total) + int(p / total)),
+                            f"[{_i + 1}/{len(files)}] {name}: {m}")
+
+            try:
+                status, info = fn(src, cb)
+                (done if status == "ok" else skipped).append((name, str(info)))
+            except Exception as e:
+                failed.append((name, str(e)))
+            progress_cb(int(100 * (i + 1) / total), f"{title} {i + 1}/{len(files)} 完成")
+        progress_cb(100, f"{title}完成")
+        return MainWindow._batch_report(title, done, failed, skipped)
+
+    @staticmethod
+    def _batch_report(title: str, done: list, failed: list, skipped: list | None = None) -> dict:
+        skipped = skipped or []
+        lines = [f"{title}：共 {len(done) + len(failed) + len(skipped)} 个文件，"
+                 f"成功 {len(done)}，跳过 {len(skipped)}，失败 {len(failed)}", ""]
+        for item in done:
+            lines.append(f"✓ {item[0]}  {item[1]}")
+        for name, info in skipped:
+            lines.append(f"○ {name}  {info}")
+        for name, err in failed:
+            lines.append(f"✗ {name}  {err}")
+        return {"output": "", "report": "\n".join(lines)}
 
     def _run(self, name: str, fn, *args, on_done=None, **kwargs):
         if getattr(self, "_busy", False):
@@ -1262,7 +1349,6 @@ class MainWindow(QMainWindow):
         self.feature_ref = None
         self._mark_in = None
         self._mark_out = None
-        self.ed_asr_src.setText(self.src)
         self._load_waveform()
         self._update_sel_label()
 
@@ -1403,7 +1489,8 @@ class MainWindow(QMainWindow):
         return [k for k, cb in self.chk.items() if cb.isChecked()]
 
     def apply_removals(self):
-        if not self._require_src():
+        files = self._collect_source(self.grp_removal)
+        if not files:
             return
         kinds = self._selected_removals()
         if not kinds:
@@ -1415,10 +1502,10 @@ class MainWindow(QMainWindow):
         strength = float(self.spin_strength.value())
         thr = float(self.spin_spk_thr.value())
         names = "+".join(dict(audio_ops.REMOVAL_TYPES)[k] for k in kinds)
-        out_wav = self.out_path(f"_消除_{names}", ".wav")
-        out = self.out_path(f"_消除_{names}")
-        self._run(f"消除({names})", self._job_removals, self.src, out, out_wav,
-                  kinds, strength, thr, self.speaker_ref, on_done=self._reload_wave)
+        # 说话人参考音频取自标记所在的当前文件（批量时只提取一次，应用到全部源文件）
+        ref_src = os.path.abspath(self.src) if ("speaker" in kinds and self.src) else None
+        self._run(f"消除({names})", self._job_removals_batch, files, kinds, strength, thr,
+                  self.speaker_ref, ref_src, names, on_done=self._reload_wave)
 
     def _reload_wave(self, res=None):
         if res:
@@ -1426,20 +1513,51 @@ class MainWindow(QMainWindow):
         self._load_waveform()
 
     @staticmethod
-    def _job_removals(src, out, out_wav, kinds, strength, thr, spk_ref, progress_cb=None):
+    def _job_removals_batch(files, kinds, strength, thr, spk_ref, ref_src, names,
+                            progress_cb=None):
+        from . import filetools
+        import soundfile as sf
+        ref_audio = None
+        if "speaker" in kinds and spk_ref is not None and ref_src:
+            tmp = ref_src + ".ref.wav"
+            ft.extract_audio(ref_src, tmp, sr=16000, start=spk_ref[0], end=spk_ref[1])
+            ref_audio, _ = sf.read(tmp, dtype="float32")
+            if ref_audio.ndim > 1:
+                ref_audio = ref_audio.mean(axis=1)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        suffix = f"_消除_{names}"
+
+        def per(src, cb):
+            out_wav = filetools.plan_output(src, "", "", suffix=suffix, ext=".wav")
+            out = filetools.plan_output(src, "", "", suffix=suffix)
+            res = MainWindow._job_removals(src, out, out_wav, kinds, strength, thr,
+                                           spk_ref, progress_cb=cb, ref_audio=ref_audio)
+            return "ok", f"→ {os.path.basename(res['output'])}"
+
+        return MainWindow._batch_loop(f"消除({names})", files, per, progress_cb)
+
+    @staticmethod
+    def _job_removals(src, out, out_wav, kinds, strength, thr, spk_ref,
+                      progress_cb=None, ref_audio=None):
         def prog(p, m):
             progress_cb(p, m)
         y, sr = audio_ops.load_wav(src, 16000)
         ref = None
         if kinds and "speaker" in kinds and spk_ref is not None:
-            import soundfile as sf
-            tmp = out_wav + ".ref.wav"
-            ft.extract_audio(src, tmp, sr=16000, start=spk_ref[0], end=spk_ref[1])
-            ref, _ = sf.read(tmp, dtype="float32")
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
+            if ref_audio is not None:
+                ref = ref_audio
+            else:
+                import soundfile as sf
+                tmp = out_wav + ".ref.wav"
+                ft.extract_audio(src, tmp, sr=16000, start=spk_ref[0], end=spk_ref[1])
+                ref, _ = sf.read(tmp, dtype="float32")
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
         y2, report = audio_ops.process_removals(y, sr, kinds, strength,
                                                 speaker_ref=ref, speaker_threshold=thr,
                                                 progress=prog)
@@ -1452,11 +1570,22 @@ class MainWindow(QMainWindow):
         return {"output": out, "report": report}
 
     def apply_modelscope_enhance(self):
-        if not self._require_src():
+        files = self._collect_source(self.grp_removal)
+        if not files:
             return
-        out_wav = self.out_path("_魔塔增强", ".wav")
-        out = self.out_path("_魔塔增强")
-        self._run("魔塔增强", self._job_modelscope, self.src, out_wav, out)
+        self._run("魔塔增强", self._job_modelscope_batch, files)
+
+    @staticmethod
+    def _job_modelscope_batch(files, progress_cb=None):
+        from . import filetools
+
+        def per(src, cb):
+            out_wav = filetools.plan_output(src, "", "", suffix="_魔塔增强", ext=".wav")
+            out = filetools.plan_output(src, "", "", suffix="_魔塔增强")
+            r = MainWindow._job_modelscope(src, out_wav, out, progress_cb=cb)
+            return "ok", f"→ {os.path.basename(r)}"
+
+        return MainWindow._batch_loop("魔塔增强", files, per, progress_cb)
 
     @staticmethod
     def _job_modelscope(src, out_wav, out, progress_cb=None):
@@ -1476,47 +1605,9 @@ class MainWindow(QMainWindow):
         return out
 
     # ---------------------------------------------------------------- 分割
-    def _split_add_files(self):
-        files, _ = QFileDialog.getOpenFileNames(self, "选择要分割的媒体文件", "", "媒体文件 (*)")
-        existing = {self.lst_split.item(i).text() for i in range(self.lst_split.count())}
-        for f in files:
-            f = os.path.abspath(f)
-            if f not in existing:
-                self.lst_split.addItem(f)
-                existing.add(f)
-
-    def _split_add_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "选择媒体目录（递归扫描子目录）", "")
-        if d:
-            d = os.path.abspath(d)
-            existing = {self.lst_split.item(i).text() for i in range(self.lst_split.count())}
-            if d not in existing:
-                self.lst_split.addItem(d)
-
-    def _split_del_selected(self):
-        for item in self.lst_split.selectedItems():
-            self.lst_split.takeItem(self.lst_split.row(item))
-
     def _split_collect(self) -> list[str] | None:
-        """收集分割源：列表（文件+目录递归扫描）；列表为空时回退到当前打开的文件。"""
-        from . import filetools
-        inputs = [self.lst_split.item(i).text() for i in range(self.lst_split.count())]
-        if inputs:
-            missing = [p for p in inputs if not os.path.exists(p)]
-            if missing:
-                QMessageBox.warning(self, "提示", "以下路径不存在：\n" + "\n".join(missing[:5]))
-                return None
-            files = filetools.scan_inputs(inputs, filetools.MEDIA_EXTS,
-                                          recursive=self.chk_split_recurse.isChecked())
-            if not files:
-                QMessageBox.information(self, "提示", "所选路径中没有可分割的音视频文件")
-                return None
-            return files
-        if not self.src:
-            QMessageBox.information(self, "提示",
-                                    "请先添加要分割的文件/目录，或打开一个媒体文件")
-            return None
-        return [os.path.abspath(self.src)]
+        """收集分割源：统一源文件组（文件+目录递归扫描）；列表为空回退当前打开的文件。"""
+        return self._collect_source(self.grp_split)
 
     def _split_opts(self) -> tuple[bool, int]:
         use_subdir = self.chk_split_subdir.isChecked()
@@ -1535,17 +1626,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _split_report(title: str, done: list, failed: list, skipped: list | None = None) -> dict:
-        skipped = skipped or []
-        lines = [f"{title}：共 {len(done) + len(failed) + len(skipped)} 个文件，"
-                 f"成功 {len(done)}，跳过 {len(skipped)}，失败 {len(failed)}", ""]
-        for item in done:
-            lines.append(f"✓ {item[0]}  {item[1]}")
-        for name, info in skipped:
-            lines.append(f"○ {name}  {info}")
-        for name, err in failed:
-            lines.append(f"✗ {name}  {err}")
-        first_out = done[0][2] if done and len(done[0]) > 2 else ""
-        return {"output": first_out, "report": "\n".join(lines)}
+        return MainWindow._batch_report(title, done, failed, skipped)
 
     def split_fixed(self):
         files = self._split_collect()
@@ -1813,39 +1894,29 @@ class MainWindow(QMainWindow):
         return ft.merge_av(v, a, out, audio_offset=offset, use_shortest=shortest)
 
     def extract_audio(self):
-        if not self._require_src():
+        files = self._collect_source(self.grp_extract)
+        if not files:
             return
         ext = self.cmb_extract_fmt.currentData() or ".wav"
-        out = self.out_path("_音频", ext)
-        self._run("分离音频",
-                  lambda src, o, progress_cb=None: ft.extract_audio_keep(src, o),
-                  self.src, out)
+        self._run("分离音频", self._job_extract_batch, files, ext)
+
+    @staticmethod
+    def _job_extract_batch(files, ext, progress_cb=None):
+        from . import filetools
+
+        def per(src, cb):
+            out = filetools.plan_output(src, "", "", suffix="_音频", ext=ext)
+            ft.extract_audio_keep(src, out)
+            cb(100, "完成")
+            return "ok", f"→ {os.path.basename(out)}"
+
+        return MainWindow._batch_loop("分离音频", files, per, progress_cb)
 
     # ---------------------------------------------------------------- 格式转换
-    def _conv_add_files(self):
-        files, _ = QFileDialog.getOpenFileNames(self, "选择媒体文件", "", "媒体文件 (*)")
-        existing = {self.lst_convert.item(i).text() for i in range(self.lst_convert.count())}
-        for f in files:
-            f = os.path.abspath(f)
-            if f not in existing:
-                self.lst_convert.addItem(f)
-
-    def _conv_add_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "选择媒体目录（递归扫描子目录）", "")
-        if d:
-            d = os.path.abspath(d)
-            existing = {self.lst_convert.item(i).text() for i in range(self.lst_convert.count())}
-            if d not in existing:
-                self.lst_convert.addItem(d)
-
-    def _conv_del_selected(self):
-        for item in self.lst_convert.selectedItems():
-            self.lst_convert.takeItem(self.lst_convert.row(item))
-
     def convert_media_batch(self):
-        inputs = [self.lst_convert.item(i).text() for i in range(self.lst_convert.count())]
+        inputs = self.grp_convert.paths()
         if not inputs:
-            QMessageBox.information(self, "提示", "请先添加要转换的媒体文件或目录")
+            QMessageBox.information(self, "提示", "请先添加要转换的媒体文件或目录（列表留空 = 转换当前打开的文件）")
             return
         missing = [p for p in inputs if not os.path.exists(p)]
         if missing:
@@ -1861,7 +1932,7 @@ class MainWindow(QMainWindow):
             sr = None
         denoise = float(self.spin_conv_denoise.value()) if self.chk_conv_denoise.isChecked() else 0.0
         out_root = self.ed_conv_outroot.text().strip()
-        recurse = self.chk_conv_recurse.isChecked()
+        recurse = self.grp_convert.chk_recurse.isChecked()
         keep_struct = self.chk_conv_keepstruct.isChecked()
         name_len = int(self.spin_conv_namelen.value()) if self.chk_conv_namelen.isChecked() else 0
         self._run("格式转换", self._job_convert, inputs, fmt, bitrate, sr, denoise,
@@ -1961,12 +2032,24 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- 时间轴
     def change_speed(self):
-        if not self._require_src():
+        files = self._collect_source(self.grp_timeline)
+        if not files:
             return
         sp = float(self.spin_speed.value())
-        out = self.out_path(f"_x{sp:g}")
-        self._run("变速", lambda src, o, s, progress_cb=None: ft.change_speed(src, o, s),
-                  self.src, out, sp)
+        self._run("变速", self._job_speed_batch, files, sp)
+
+    @staticmethod
+    def _job_speed_batch(files, sp, progress_cb=None):
+        from . import filetools
+        suffix = f"_x{sp:g}"
+
+        def per(src, cb):
+            out = filetools.plan_output(src, "", "", suffix=suffix)
+            ft.change_speed(src, out, sp)
+            cb(100, "完成")
+            return "ok", f"→ {os.path.basename(out)}"
+
+        return MainWindow._batch_loop(f"变速 x{sp:g}", files, per, progress_cb)
 
     def _require_video(self) -> bool:
         if not self._require_src():
@@ -2004,17 +2087,30 @@ class MainWindow(QMainWindow):
         self.log_append("[同步预览] 已恢复播放原文件")
 
     def apply_av_sync(self):
-        """按当前偏移量生成新文件：视频流 copy，音频提前/推迟。"""
-        if not self._require_video():
+        """按当前偏移量批量生成新文件：视频流 copy，音频提前/推迟（纯音频自动跳过）。"""
+        files = self._collect_source(self.grp_timeline)
+        if not files:
             return
         off = float(self.spin_av_sync.value())
         if abs(off) < 0.001:
             QMessageBox.information(self, "提示", "偏移量为 0，无需处理")
             return
-        out = self.out_path(f"_同步{off:+g}s")
-        self._run("音画同步",
-                  lambda src, o, f, progress_cb=None: ft.av_sync_offset(src, o, f),
-                  self.src, out, off)
+        self._run("音画同步", self._job_sync_batch, files, off)
+
+    @staticmethod
+    def _job_sync_batch(files, off, progress_cb=None):
+        from . import filetools
+        suffix = f"_同步{off:+g}s"
+
+        def per(src, cb):
+            if not ft.is_video(src):
+                return "skip", "纯音频文件，音画同步仅对视频有效"
+            out = filetools.plan_output(src, "", "", suffix=suffix, ext=".mp4")
+            ft.av_sync_offset(src, out, off)
+            cb(100, "完成")
+            return "ok", f"→ {os.path.basename(out)}"
+
+        return MainWindow._batch_loop(f"音画同步 {off:+g}s", files, per, progress_cb)
 
     def trim_selection(self):
         if not self._require_src():
@@ -2028,7 +2124,8 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- 特征剔除
     def remove_text_feature(self):
-        if not self._require_src():
+        files = self._collect_source(self.grp_feature)
+        if not files:
             return
         kws = [k.strip() for k in self.ed_keywords.text().replace("，", ",").split(",") if k.strip()]
         if not kws:
@@ -2041,8 +2138,21 @@ class MainWindow(QMainWindow):
                                 f"模型: {msa.ASR_MODEL_ID}（首次运行自动下载）")
             return
         mute = self.cmb_text_mode.currentText() == "静音该段"
-        out = self.out_path("_文字剔除")
-        self._run("文字特征剔除", self._job_text_remove, self.src, out, kws, mute)
+        self._run("文字特征剔除", self._job_text_remove_batch, files, kws, mute)
+
+    @staticmethod
+    def _job_text_remove_batch(files, kws, mute, progress_cb=None):
+        from . import filetools
+
+        def per(src, cb):
+            out = filetools.plan_output(src, "", "", suffix="_文字剔除",
+                                        ext=".mp4" if ft.is_video(src) else ".m4a")
+            r = MainWindow._job_text_remove(src, out, kws, mute, progress_cb=cb)
+            if isinstance(r, dict):
+                return "ok", f"→ {os.path.basename(r['output'])}"
+            return "skip", str(r)
+
+        return MainWindow._batch_loop("文字特征剔除", files, per, progress_cb)
 
     @staticmethod
     def _job_text_remove(src, out, kws, mute, progress_cb=None):
@@ -2066,19 +2176,49 @@ class MainWindow(QMainWindow):
         return {"output": out, "matched": matched}
 
     def remove_similar_feature(self):
-        if not self._require_src():
+        files = self._collect_source(self.grp_feature)
+        if not files:
             return
         if self.feature_ref is None and self.feature_ref_file is None:
             QMessageBox.information(self, "提示", "请先『设为相似特征参考』或导入参考音频文件")
             return
         mute = self.cmb_sim_mode.currentText() == "静音该段"
         thr = float(self.spin_sim_thr.value())
-        out = self.out_path("_相似剔除")
-        self._run("相似特征剔除", self._job_sim_remove, self.src, out,
-                  self.feature_ref, self.feature_ref_file, thr, mute)
+        # 参考音频取自标记所在的当前文件（批量时只提取一次）
+        ref_src = os.path.abspath(self.src) if (self.feature_ref is not None and self.src) else None
+        self._run("相似特征剔除", self._job_sim_remove_batch, files,
+                  self.feature_ref, self.feature_ref_file, thr, mute, ref_src)
 
     @staticmethod
-    def _job_sim_remove(src, out, feat_ref, feat_file, thr, mute, progress_cb=None):
+    def _job_sim_remove_batch(files, feat_ref, feat_file, thr, mute, ref_src,
+                              progress_cb=None):
+        from . import filetools
+        import soundfile as sf
+        ref_audio = None
+        if not feat_file and feat_ref is not None and ref_src:
+            tmp = ref_src + ".feat.wav"
+            ft.extract_audio(ref_src, tmp, sr=16000, start=feat_ref[0], end=feat_ref[1])
+            ref_audio, _ = sf.read(tmp, dtype="float32")
+            if ref_audio.ndim > 1:
+                ref_audio = ref_audio.mean(axis=1)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+        def per(src, cb):
+            out = filetools.plan_output(src, "", "", suffix="_相似剔除")
+            r = MainWindow._job_sim_remove(src, out, feat_ref, feat_file, thr, mute,
+                                           progress_cb=cb, ref_audio=ref_audio)
+            if isinstance(r, str) and os.path.isfile(r):
+                return "ok", f"→ {os.path.basename(r)}"
+            return "skip", str(r)
+
+        return MainWindow._batch_loop("相似特征剔除", files, per, progress_cb)
+
+    @staticmethod
+    def _job_sim_remove(src, out, feat_ref, feat_file, thr, mute,
+                        progress_cb=None, ref_audio=None):
         import soundfile as sf
         progress_cb(10, "提取音频…")
         y, sr = audio_ops.load_wav(src, 16000)
@@ -2086,6 +2226,8 @@ class MainWindow(QMainWindow):
             ref, rsr = sf.read(feat_file, dtype="float32")
             if ref.ndim > 1:
                 ref = ref.mean(axis=1)
+        elif ref_audio is not None:
+            ref = ref_audio
         else:
             tmp = src + ".feat.wav"
             ft.extract_audio(src, tmp, sr=16000, start=feat_ref[0], end=feat_ref[1])
@@ -2109,20 +2251,9 @@ class MainWindow(QMainWindow):
         return out
 
     # ---------------------------------------------------------------- 语音转文字
-    def _pick_asr_src(self):
-        f, _ = QFileDialog.getOpenFileName(self, "选择要识别的文件", "", "媒体文件 (*)")
-        if f:
-            self.ed_asr_src.setText(f)
-
-    def _asr_use_current(self):
-        if not self._require_src():
-            return
-        self.ed_asr_src.setText(self.src)
-
     def run_asr_export(self):
-        src = self.ed_asr_src.text().strip()
-        if not (src and os.path.isfile(src)):
-            QMessageBox.information(self, "提示", "请选择有效的音频或视频文件")
+        files = self._collect_source(self.grp_asr)
+        if not files:
             return
         fmts = [name for name, chk in
                 (("txt", self.chk_out_txt), ("srt", self.chk_out_srt), ("lrc", self.chk_out_lrc))
@@ -2135,9 +2266,19 @@ class MainWindow(QMainWindow):
                                 "语音识别需要魔塔 ASR 模型。\n\n请先执行:\n  uv sync --extra modelscope\n\n"
                                 f"模型: {msa.ASR_MODEL_ID}（首次运行自动下载）")
             return
-        base = os.path.splitext(src)[0]
-        self._run("语音识别导出", self._job_asr_export, src, base, fmts,
+        self._run("语音识别导出", self._job_asr_batch, files, fmts,
                   on_done=self._after_asr_export)
+
+    @staticmethod
+    def _job_asr_batch(files, fmts, progress_cb=None):
+        def per(src, cb):
+            base = os.path.splitext(src)[0]
+            r = MainWindow._job_asr_export(src, base, fmts, progress_cb=cb)
+            if isinstance(r, dict):
+                return "ok", f"→ {os.path.basename(base)}.{'/'.join(fmts)}"
+            return "skip", str(r)
+
+        return MainWindow._batch_loop("语音识别导出", files, per, progress_cb)
 
     @staticmethod
     def _job_asr_export(src, base, fmts, progress_cb=None):
@@ -2171,15 +2312,25 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- 去背景音乐
     def remove_background_music(self):
-        if not self._require_src():
+        files = self._collect_source(self.grp_removal)
+        if not files:
             return
         if not separation.available():
             QMessageBox.warning(self, "缺少依赖",
                                 "人声/伴奏分离需要 torchaudio。\n\n请先执行:\n  uv sync --extra modelscope")
             return
         keep = float(self.spin_acc_keep.value())
-        acc_out = os.path.splitext(self.src)[0] + "_伴奏.wav" if self.chk_acc_out.isChecked() else None
-        self._run("去背景音乐", self._job_music_remove, self.src, keep, acc_out)
+        acc_out = self.chk_acc_out.isChecked()
+        self._run("去背景音乐", self._job_music_batch, files, keep, acc_out)
+
+    @staticmethod
+    def _job_music_batch(files, keep, acc_out, progress_cb=None):
+        def per(src, cb):
+            acc_path = os.path.splitext(src)[0] + "_伴奏.wav" if acc_out else None
+            r = MainWindow._job_music_remove(src, keep, acc_path, progress_cb=cb)
+            return "ok", f"→ {os.path.basename(r)}"
+
+        return MainWindow._batch_loop("去背景音乐", files, per, progress_cb)
 
     @staticmethod
     def _job_music_remove(src, keep_ratio, acc_path, progress_cb=None):

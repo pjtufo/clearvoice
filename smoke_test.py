@@ -172,6 +172,22 @@ from PySide6.QtWidgets import QApplication
 app = QApplication([])
 w = main_window.MainWindow()
 w.show()
+# 各功能页签统一源文件组件 SourceFileGroup
+for _g in ("grp_removal", "grp_split", "grp_extract", "grp_convert",
+           "grp_timeline", "grp_feature", "grp_asr"):
+    assert hasattr(w, _g), f"缺少统一源文件组件 {_g}"
+    assert getattr(w, _g).chk_recurse.isChecked(), f"{_g} 递归应默认开启"
+# 通用批量循环：成功/跳过/失败统计
+def _batch_fn(src, cb):
+    cb(50, "half")
+    if "bad" in src:
+        raise RuntimeError("boom")
+    if "skip" in src:
+        return "skip", "无内容"
+    return "ok", "done"
+_br = main_window.MainWindow._batch_loop(
+    "测试批", ["a.wav", "skip.wav", "bad.wav"], _batch_fn, progress_cb=lambda *a: None)
+assert "成功 1" in _br["report"] and "跳过 1" in _br["report"] and "失败 1" in _br["report"], _br["report"]
 # 波形新特性：立体声双行 / 缩放 / 时间刻度（纯逻辑断言）
 wv = w.wave
 y_st = np.zeros((16000 * 3, 2), dtype=np.float32)
